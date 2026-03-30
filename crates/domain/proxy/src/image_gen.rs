@@ -345,6 +345,27 @@ pub async fn generate_gemini(
     Err("No image found in Gemini response".to_string())
 }
 
+/// Check if an IP address is private/internal (loopback, private, link-local).
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+            || v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_link_local()     // 169.254.0.0/16 (cloud metadata)
+            || v4.is_unspecified()    // 0.0.0.0
+            || v4.is_broadcast()      // 255.255.255.255
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()          // ::1
+            || v6.is_unspecified()    // ::
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x)
+            || v6.to_ipv4_mapped().map_or(false, |v4| {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            })
+        }
+    }
+}
+
 /// Validate that a URL is safe to fetch (no SSRF).
 fn validate_fetch_url(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
@@ -354,35 +375,41 @@ fn validate_fetch_url(url: &str) -> Result<(), String> {
         scheme => return Err(format!("Unsupported URL scheme: {scheme}")),
     }
 
-    let host = parsed.host_str().unwrap_or("");
+    let host = parsed.host_str().ok_or("URL has no host")?;
 
-    // Block private/internal IP ranges
-    if host == "localhost"
-        || host == "metadata.google.internal"
-        || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || host == "[::1]"
-        || host.starts_with("0.")
-    {
-        return Err("URL points to a private/internal address".into());
+    // Try parsing as IP address first (handles decimal, hex, octal, IPv6 forms)
+    // reqwest::Url normalises IPs during parsing, so host_str() for an IP URL
+    // will be the canonical form (e.g. "127.0.0.1" for decimal 2130706433).
+    // Also try stripping brackets for IPv6.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if is_private_ip(ip) {
+            return Err("URL points to a private/internal address".into());
+        }
     }
 
-    // Block 172.16.0.0/12 range
-    if host.starts_with("172.") {
-        if let Some(second_octet) = host.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()) {
-            if (16..=31).contains(&second_octet) {
-                return Err("URL points to a private/internal address".into());
-            }
-        }
+    // Block known internal hostnames
+    if host == "localhost"
+        || host == "metadata.google.internal"
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+    {
+        return Err("URL points to a private/internal address".into());
     }
 
     Ok(())
 }
 
+/// Build a reqwest client that does not follow redirects (SSRF protection).
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
+
 /// Fetch an image URL as raw bytes.
-async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+async fn fetch_image_bytes(_client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if url.starts_with("data:") {
         // Base64 data URL
         let b64 = url
@@ -396,7 +423,7 @@ async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8
 
     validate_fetch_url(url)?;
 
-    let resp = client
+    let resp = no_redirect_client()
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -411,7 +438,7 @@ async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8
 
 /// Fetch an image URL as base64 data + MIME type.
 async fn fetch_image_as_base64(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     url: &str,
 ) -> Result<(String, String), String> {
     if url.starts_with("data:") {
@@ -427,7 +454,7 @@ async fn fetch_image_as_base64(
 
     validate_fetch_url(url)?;
 
-    let resp = client
+    let resp = no_redirect_client()
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
