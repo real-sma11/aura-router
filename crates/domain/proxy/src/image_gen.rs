@@ -345,6 +345,42 @@ pub async fn generate_gemini(
     Err("No image found in Gemini response".to_string())
 }
 
+/// Validate that a URL is safe to fetch (no SSRF).
+fn validate_fetch_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("Unsupported URL scheme: {scheme}")),
+    }
+
+    let host = parsed.host_str().unwrap_or("");
+
+    // Block private/internal IP ranges
+    if host == "localhost"
+        || host == "metadata.google.internal"
+        || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+        || host == "[::1]"
+        || host.starts_with("0.")
+    {
+        return Err("URL points to a private/internal address".into());
+    }
+
+    // Block 172.16.0.0/12 range
+    if host.starts_with("172.") {
+        if let Some(second_octet) = host.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()) {
+            if (16..=31).contains(&second_octet) {
+                return Err("URL points to a private/internal address".into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Fetch an image URL as raw bytes.
 async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if url.starts_with("data:") {
@@ -357,6 +393,8 @@ async fn fetch_image_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8
             .decode(b64)
             .map_err(|e| format!("Invalid base64: {e}"));
     }
+
+    validate_fetch_url(url)?;
 
     let resp = client
         .get(url)
@@ -386,6 +424,8 @@ async fn fetch_image_as_base64(
         let b64 = url.find(',').map(|i| &url[i + 1..]).unwrap_or(url);
         return Ok((b64.to_string(), mime));
     }
+
+    validate_fetch_url(url)?;
 
     let resp = client
         .get(url)
