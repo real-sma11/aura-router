@@ -298,13 +298,12 @@ pub async fn generate_gemini(
         }
     });
 
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key={api_key}"
-    );
+    let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent";
 
     let resp = client
-        .post(&url)
+        .post(url)
         .header("content-type", "application/json")
+        .header("x-goog-api-key", api_key)
         .json(&body)
         .send()
         .await
