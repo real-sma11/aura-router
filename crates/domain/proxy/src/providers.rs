@@ -3,7 +3,7 @@
 use reqwest::header::{HeaderMap, HeaderValue};
 
 /// Supported LLM providers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
     OpenAi,
@@ -19,8 +19,50 @@ impl Provider {
     }
 }
 
-/// Resolve a model name to its provider.
-pub fn resolve_provider(model: &str) -> Option<Provider> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel<'a> {
+    pub requested_model: &'a str,
+    pub upstream_model: &'a str,
+    pub provider: Provider,
+}
+
+fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
+    match model {
+        "aura-claude-opus-4-6" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-opus-4-6",
+            provider: Provider::Anthropic,
+        }),
+        "aura-claude-sonnet-4-6" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-sonnet-4-6",
+            provider: Provider::Anthropic,
+        }),
+        "aura-claude-haiku-4-5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-haiku-4-5-20251001",
+            provider: Provider::Anthropic,
+        }),
+        "aura-gpt-4.1" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gpt-4.1",
+            provider: Provider::OpenAi,
+        }),
+        "aura-o3" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "o3",
+            provider: Provider::OpenAi,
+        }),
+        "aura-o4-mini" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "o4-mini",
+            provider: Provider::OpenAi,
+        }),
+        _ => None,
+    }
+}
+
+fn infer_provider(model: &str) -> Option<Provider> {
     if model.starts_with("claude") {
         Some(Provider::Anthropic)
     } else if model.starts_with("gpt")
@@ -35,6 +77,24 @@ pub fn resolve_provider(model: &str) -> Option<Provider> {
     }
 }
 
+/// Resolve an Aura or upstream model name into its upstream provider/model pair.
+pub fn resolve_model(model: &str) -> Option<ResolvedModel<'_>> {
+    if let Some(alias) = aura_model_alias(model) {
+        return Some(alias);
+    }
+
+    infer_provider(model).map(|provider| ResolvedModel {
+        requested_model: model,
+        upstream_model: model,
+        provider,
+    })
+}
+
+/// Resolve a model name to its provider.
+pub fn resolve_provider(model: &str) -> Option<Provider> {
+    resolve_model(model).map(|resolved| resolved.provider)
+}
+
 /// Get the base URL for a provider's messages endpoint.
 pub fn provider_url(provider: &Provider) -> &'static str {
     match provider {
@@ -45,7 +105,10 @@ pub fn provider_url(provider: &Provider) -> &'static str {
 
 /// Get the maximum context window size for a model (in tokens).
 pub fn max_context_tokens(model: &str) -> u64 {
-    match model {
+    let resolved_model = resolve_model(model)
+        .map(|resolved| resolved.upstream_model)
+        .unwrap_or(model);
+    match resolved_model {
         // Anthropic
         m if m.starts_with("claude-opus-4") => 1_000_000,
         m if m.starts_with("claude-sonnet-4") => 1_000_000,
@@ -89,4 +152,30 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
     }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     Some(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_model, resolve_provider, Provider};
+
+    #[test]
+    fn resolves_aura_aliases_to_upstream_models() {
+        let resolved = resolve_model("aura-o4-mini").expect("model alias should resolve");
+        assert_eq!(resolved.requested_model, "aura-o4-mini");
+        assert_eq!(resolved.upstream_model, "o4-mini");
+        assert_eq!(resolved.provider, Provider::OpenAi);
+    }
+
+    #[test]
+    fn preserves_upstream_model_names() {
+        let resolved = resolve_model("claude-sonnet-4-6").expect("provider should resolve");
+        assert_eq!(resolved.requested_model, "claude-sonnet-4-6");
+        assert_eq!(resolved.upstream_model, "claude-sonnet-4-6");
+        assert_eq!(resolved.provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn resolve_provider_understands_aura_aliases() {
+        assert_eq!(resolve_provider("aura-gpt-4.1"), Some(Provider::OpenAi));
+    }
 }

@@ -56,7 +56,7 @@ pub async fn messages(
     let request_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?;
 
-    let model = request_value
+    let requested_model = request_value
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing 'model' field".into()))?;
@@ -66,9 +66,10 @@ pub async fn messages(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Resolve provider from model name
-    let provider = providers::resolve_provider(model)
-        .ok_or_else(|| AppError::BadRequest(format!("Unsupported model: {model}")))?;
+    // Resolve the Aura-facing model id into an upstream provider/model pair.
+    let resolved_model = providers::resolve_model(requested_model)
+        .ok_or_else(|| AppError::BadRequest(format!("Unsupported model: {requested_model}")))?;
+    let provider = resolved_model.provider;
 
     // Pre-check credits (conservative minimum: 1 credit)
     let balance = billing::check_credits(
@@ -105,7 +106,7 @@ pub async fn messages(
     // [ENRICHMENT HOOK — v1: pass-through, future: RAG/memory/prompt modification]
 
     // Resolve API key for the provider
-    let api_key = match provider {
+    let api_key = match resolved_model.provider {
         providers::Provider::Anthropic => state.anthropic_api_key.clone(),
         providers::Provider::OpenAi => state
             .openai_api_key
@@ -114,15 +115,21 @@ pub async fn messages(
     };
 
     // Forward to provider
-    let upstream_url = providers::provider_url(&provider);
+    let upstream_url = providers::provider_url(&resolved_model.provider);
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
+    let mut upstream_request_value = request_value.clone();
+    upstream_request_value["model"] = serde_json::Value::String(
+        resolved_model.upstream_model.to_string(),
+    );
+    let upstream_body = serde_json::to_vec(&upstream_request_value)
+        .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
     let upstream_resp = state
         .http_client
         .post(upstream_url)
         .headers(upstream_headers)
-        .body(body.to_vec())
+        .body(upstream_body)
         .send()
         .await
         .map_err(|e| AppError::ProviderError(format!("Provider unreachable: {e}")))?;
@@ -146,7 +153,7 @@ pub async fn messages(
         return handle_streaming(
             auth,
             state,
-            model,
+            requested_model,
             provider_name,
             upstream_resp,
             session_ctx,
@@ -159,7 +166,7 @@ pub async fn messages(
     handle_non_streaming(
         auth,
         state,
-        model,
+        requested_model,
         provider_name,
         upstream_resp,
         session_ctx,
