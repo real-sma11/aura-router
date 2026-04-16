@@ -2,6 +2,13 @@ use serde_json::{json, Value};
 
 use crate::providers::Provider;
 
+pub fn validate_request(provider: Provider, request: &Value) -> Result<(), String> {
+    match provider {
+        Provider::Anthropic => Ok(()),
+        Provider::OpenAi => validate_openai_request(request),
+    }
+}
+
 pub fn request_to_upstream(
     provider: Provider,
     upstream_model: &str,
@@ -13,7 +20,10 @@ pub fn request_to_upstream(
             next["model"] = Value::String(upstream_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi => anthropic_request_to_openai(request, upstream_model),
+        Provider::OpenAi => {
+            validate_openai_request(request)?;
+            anthropic_request_to_openai(request, upstream_model)
+        }
     }
 }
 
@@ -120,6 +130,97 @@ fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<
     Ok(upstream)
 }
 
+fn validate_openai_request(request: &Value) -> Result<(), String> {
+    if request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(
+            "Streaming for OpenAI-backed Aura models is not supported on /v1/messages yet"
+                .to_string(),
+        );
+    }
+
+    if request.get("thinking").is_some() {
+        return Err(
+            "OpenAI-backed Aura models do not support Anthropic thinking on /v1/messages yet"
+                .to_string(),
+        );
+    }
+
+    validate_system_blocks(request.get("system"))?;
+    validate_message_blocks(request.get("messages"))?;
+
+    Ok(())
+}
+
+fn validate_system_blocks(system: Option<&Value>) -> Result<(), String> {
+    let Some(system) = system else {
+        return Ok(());
+    };
+
+    match system {
+        Value::String(_) => Ok(()),
+        Value::Array(blocks) => {
+            for block in blocks {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if block_type != "text" {
+                    return Err(format!(
+                        "OpenAI-backed Aura models only support text system blocks on /v1/messages (got `{block_type}`)"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err("System prompt must be a string or content block array".to_string()),
+    }
+}
+
+fn validate_message_blocks(messages: Option<&Value>) -> Result<(), String> {
+    let messages = messages
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Anthropic request is missing messages array".to_string())?;
+
+    for (message_index, message) in messages.iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Anthropic message {message_index} is missing role"))?;
+        let blocks = message
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("Anthropic message {message_index} is missing content array"))?;
+
+        for block in blocks {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let supported = match role {
+                "user" => matches!(block_type, "text" | "image" | "tool_result"),
+                "assistant" => matches!(block_type, "text" | "tool_use"),
+                other => {
+                    return Err(format!(
+                        "OpenAI-backed Aura models do not support Anthropic role `{other}`"
+                    ));
+                }
+            };
+
+            if !supported {
+                return Err(format!(
+                    "OpenAI-backed Aura models do not support `{block_type}` blocks for `{role}` messages on /v1/messages"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn append_user_messages(blocks: &[Value], messages: &mut Vec<Value>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut rich_parts: Vec<Value> = Vec::new();
@@ -151,7 +252,10 @@ fn append_user_messages(blocks: &[Value], messages: &mut Vec<Value>) {
                     .get("media_type")
                     .and_then(Value::as_str)
                     .unwrap_or("image/png");
-                let data = source.get("data").and_then(Value::as_str).unwrap_or_default();
+                let data = source
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 rich_parts.push(json!({
                     "type": "image_url",
                     "image_url": {
@@ -277,8 +381,8 @@ fn openai_response_to_anthropic(response: &Value, requested_model: &str) -> Resu
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let parsed_input =
-                serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()));
+            let parsed_input = serde_json::from_str::<Value>(arguments)
+                .unwrap_or_else(|_| Value::String(arguments.to_string()));
             content.push(json!({
                 "type": "tool_use",
                 "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -372,7 +476,7 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_to_upstream, response_from_upstream};
+    use super::{request_to_upstream, response_from_upstream, validate_request};
     use crate::providers::Provider;
     use serde_json::json;
 
@@ -419,7 +523,10 @@ mod tests {
         assert_eq!(translated["model"], "gpt-4.1");
         assert_eq!(translated["messages"][0]["role"], "system");
         assert_eq!(translated["messages"][1]["role"], "user");
-        assert_eq!(translated["messages"][2]["tool_calls"][0]["function"]["name"], "search_repo");
+        assert_eq!(
+            translated["messages"][2]["tool_calls"][0]["function"]["name"],
+            "search_repo"
+        );
         assert_eq!(translated["messages"][3]["role"], "tool");
         assert_eq!(translated["tool_choice"]["function"]["name"], "search_repo");
         assert_eq!(translated["max_completion_tokens"], 2048);
@@ -460,5 +567,35 @@ mod tests {
         assert_eq!(translated["content"][1]["type"], "tool_use");
         assert_eq!(translated["usage"]["input_tokens"], 12);
         assert_eq!(translated["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn rejects_openai_requests_with_anthropic_thinking() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "system": [{"type": "text", "text": "Be helpful"}],
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Hello"}]
+            }],
+            "thinking": {"type": "enabled", "budget_tokens": 2048}
+        });
+
+        let error = validate_request(Provider::OpenAi, &request).expect_err("request should fail");
+        assert!(error.contains("do not support Anthropic thinking"));
+    }
+
+    #[test]
+    fn rejects_openai_requests_with_unsupported_message_blocks() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "secret"}]
+            }]
+        });
+
+        let error = validate_request(Provider::OpenAi, &request).expect_err("request should fail");
+        assert!(error.contains("do not support `thinking` blocks"));
     }
 }

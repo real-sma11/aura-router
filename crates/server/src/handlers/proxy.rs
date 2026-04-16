@@ -70,12 +70,7 @@ pub async fn messages(
     let resolved_model = providers::resolve_model(requested_model)
         .ok_or_else(|| AppError::BadRequest(format!("Unsupported model: {requested_model}")))?;
     let provider = resolved_model.provider;
-
-    if is_streaming && matches!(provider, providers::Provider::OpenAi) {
-        return Err(AppError::BadRequest(
-            "Streaming for OpenAI-backed Aura models is not supported on /v1/messages yet".into(),
-        ));
-    }
+    anthropic_compat::validate_request(provider, &request_value).map_err(AppError::BadRequest)?;
 
     // Pre-check credits (conservative minimum: 1 credit)
     let balance = billing::check_credits(
@@ -124,9 +119,12 @@ pub async fn messages(
     let upstream_url = providers::provider_url(&resolved_model.provider);
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
-    let upstream_request_value =
-        anthropic_compat::request_to_upstream(provider, resolved_model.upstream_model, &request_value)
-            .map_err(AppError::BadRequest)?;
+    let upstream_request_value = anthropic_compat::request_to_upstream(
+        provider,
+        resolved_model.upstream_model,
+        &request_value,
+    )
+    .map_err(AppError::BadRequest)?;
     let upstream_body = serde_json::to_vec(&upstream_request_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
@@ -199,9 +197,12 @@ async fn handle_non_streaming(
 
     let upstream_value: serde_json::Value = serde_json::from_slice(&response_bytes)
         .map_err(|e| AppError::ProviderError(format!("Provider returned invalid JSON: {e}")))?;
-    let response_value =
-        anthropic_compat::response_from_upstream(provider_from_name(provider_name), model, &upstream_value)
-            .map_err(AppError::ProviderError)?;
+    let response_value = anthropic_compat::response_from_upstream(
+        provider_from_name(provider_name),
+        model,
+        &upstream_value,
+    )
+    .map_err(AppError::ProviderError)?;
     let normalized_response_bytes = serde_json::to_vec(&response_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode normalized response: {e}")))?;
 
