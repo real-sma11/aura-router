@@ -1,0 +1,464 @@
+use serde_json::{json, Value};
+
+use crate::providers::Provider;
+
+pub fn request_to_upstream(
+    provider: Provider,
+    upstream_model: &str,
+    request: &Value,
+) -> Result<Value, String> {
+    match provider {
+        Provider::Anthropic => {
+            let mut next = request.clone();
+            next["model"] = Value::String(upstream_model.to_string());
+            Ok(next)
+        }
+        Provider::OpenAi => anthropic_request_to_openai(request, upstream_model),
+    }
+}
+
+pub fn response_from_upstream(
+    provider: Provider,
+    requested_model: &str,
+    response: &Value,
+) -> Result<Value, String> {
+    match provider {
+        Provider::Anthropic => {
+            let mut next = response.clone();
+            next["model"] = Value::String(requested_model.to_string());
+            Ok(next)
+        }
+        Provider::OpenAi => openai_response_to_anthropic(response, requested_model),
+    }
+}
+
+fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<Value, String> {
+    let mut messages = Vec::new();
+
+    if let Some(system) = request.get("system") {
+        let system_text = flatten_text_blocks(system);
+        if !system_text.is_empty() {
+            messages.push(json!({
+                "role": "system",
+                "content": system_text,
+            }));
+        }
+    }
+
+    let request_messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Anthropic request is missing messages array".to_string())?;
+
+    for message in request_messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Anthropic message is missing role".to_string())?;
+        let blocks = message
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Anthropic message is missing content array".to_string())?;
+
+        match role {
+            "user" => append_user_messages(blocks, &mut messages),
+            "assistant" => messages.push(build_assistant_message(blocks)),
+            other => return Err(format!("Unsupported Anthropic role `{other}`")),
+        }
+    }
+
+    let mut upstream = json!({
+        "model": upstream_model,
+        "messages": messages,
+    });
+
+    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+        upstream["max_completion_tokens"] = Value::from(max_tokens);
+    }
+
+    if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
+        upstream["temperature"] = Value::from(temperature);
+    }
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        if !tools.is_empty() {
+            upstream["tools"] = Value::Array(
+                tools.iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
+                                "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                                "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    if let Some(tool_choice) = request.get("tool_choice").and_then(Value::as_object) {
+        let mapped = match tool_choice.get("type").and_then(Value::as_str) {
+            Some("auto") => Some(Value::String("auto".to_string())),
+            Some("any") => Some(Value::String("required".to_string())),
+            Some("tool") => tool_choice.get("name").and_then(Value::as_str).map(|name| {
+                json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            }),
+            Some("none") => Some(Value::String("none".to_string())),
+            _ => None,
+        };
+        if let Some(value) = mapped {
+            upstream["tool_choice"] = value;
+        }
+    }
+
+    Ok(upstream)
+}
+
+fn append_user_messages(blocks: &[Value], messages: &mut Vec<Value>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut rich_parts: Vec<Value> = Vec::new();
+    let mut has_images = false;
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if has_images {
+                    rich_parts.push(json!({ "type": "text", "text": text }));
+                } else {
+                    text_parts.push(text);
+                }
+            }
+            Some("image") => {
+                if !has_images {
+                    for text in text_parts.drain(..) {
+                        rich_parts.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+                has_images = true;
+                let source = block.get("source").unwrap_or(&Value::Null);
+                let media_type = source
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                let data = source.get("data").and_then(Value::as_str).unwrap_or_default();
+                rich_parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{media_type};base64,{data}")
+                    }
+                }));
+            }
+            Some("tool_result") => {
+                push_pending_user_message(&mut text_parts, &mut rich_parts, has_images, messages);
+                let content = stringify_tool_result_content(block.get("content"));
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                    "content": content,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    push_pending_user_message(&mut text_parts, &mut rich_parts, has_images, messages);
+}
+
+fn push_pending_user_message(
+    text_parts: &mut Vec<String>,
+    rich_parts: &mut Vec<Value>,
+    has_images: bool,
+    messages: &mut Vec<Value>,
+) {
+    if has_images {
+        if !rich_parts.is_empty() {
+            messages.push(json!({
+                "role": "user",
+                "content": Value::Array(std::mem::take(rich_parts)),
+            }));
+        }
+        text_parts.clear();
+        return;
+    }
+
+    let text = text_parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !text.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": text,
+        }));
+    }
+    text_parts.clear();
+    rich_parts.clear();
+}
+
+fn build_assistant_message(blocks: &[Value]) -> Value {
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            Some("tool_use") => {
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                tool_calls.push(json!({
+                    "id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        "arguments": input.to_string(),
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text_parts.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text_parts.join("\n\n"))
+        },
+    });
+
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    message
+}
+
+fn openai_response_to_anthropic(response: &Value, requested_model: &str) -> Result<Value, String> {
+    let choice = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "OpenAI response is missing choices".to_string())?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "OpenAI response is missing message".to_string())?;
+
+    let mut content = Vec::new();
+    if let Some(text) = extract_openai_text(message.get("content")) {
+        if !text.trim().is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text,
+            }));
+        }
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let arguments = tool_call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let parsed_input =
+                serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or_default(),
+                "input": parsed_input,
+            }));
+        }
+    }
+
+    let stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("tool_calls") => "tool_use",
+        Some("length") => "max_tokens",
+        Some("stop") => "end_turn",
+        Some("content_filter") => "end_turn",
+        _ => "end_turn",
+    };
+
+    let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+
+    Ok(json!({
+        "id": response.get("id").and_then(Value::as_str).unwrap_or_default(),
+        "model": requested_model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": Value::Null,
+            "cache_read_input_tokens": cache_read_input_tokens,
+        }
+    }))
+}
+
+fn extract_openai_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            part.pointer("/text/value")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn flatten_text_blocks(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+fn stringify_tool_result_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{request_to_upstream, response_from_upstream};
+    use crate::providers::Provider;
+    use serde_json::json;
+
+    #[test]
+    fn translates_anthropic_request_to_openai_tools_format() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "system": [{"type": "text", "text": "Be helpful"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Find a repo"}]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "search_repo",
+                        "input": {"query": "aura"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "done"
+                    }]
+                }
+            ],
+            "tools": [{
+                "name": "search_repo",
+                "description": "Search repositories",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_choice": {"type": "tool", "name": "search_repo"},
+            "max_tokens": 2048
+        });
+
+        let translated =
+            request_to_upstream(Provider::OpenAi, "gpt-4.1", &request).expect("translation");
+
+        assert_eq!(translated["model"], "gpt-4.1");
+        assert_eq!(translated["messages"][0]["role"], "system");
+        assert_eq!(translated["messages"][1]["role"], "user");
+        assert_eq!(translated["messages"][2]["tool_calls"][0]["function"]["name"], "search_repo");
+        assert_eq!(translated["messages"][3]["role"], "tool");
+        assert_eq!(translated["tool_choice"]["function"]["name"], "search_repo");
+        assert_eq!(translated["max_completion_tokens"], 2048);
+    }
+
+    #[test]
+    fn translates_openai_response_to_anthropic_blocks() {
+        let response = json!({
+            "id": "chatcmpl_123",
+            "model": "gpt-4.1",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check that.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search_repo",
+                            "arguments": "{\"query\":\"aura\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 7
+            }
+        });
+
+        let translated = response_from_upstream(Provider::OpenAi, "aura-gpt-4.1", &response)
+            .expect("translation");
+
+        assert_eq!(translated["model"], "aura-gpt-4.1");
+        assert_eq!(translated["stop_reason"], "tool_use");
+        assert_eq!(translated["content"][0]["type"], "text");
+        assert_eq!(translated["content"][1]["type"], "tool_use");
+        assert_eq!(translated["usage"]["input_tokens"], 12);
+        assert_eq!(translated["usage"]["output_tokens"], 7);
+    }
+}

@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 
 use aura_router_auth::AuthUser;
 use aura_router_core::AppError;
-use aura_router_proxy::{billing, providers, stats, storage, stream};
+use aura_router_proxy::{anthropic_compat, billing, providers, stats, storage, stream};
 
 use crate::state::AppState;
 
@@ -71,6 +71,12 @@ pub async fn messages(
         .ok_or_else(|| AppError::BadRequest(format!("Unsupported model: {requested_model}")))?;
     let provider = resolved_model.provider;
 
+    if is_streaming && matches!(provider, providers::Provider::OpenAi) {
+        return Err(AppError::BadRequest(
+            "Streaming for OpenAI-backed Aura models is not supported on /v1/messages yet".into(),
+        ));
+    }
+
     // Pre-check credits (conservative minimum: 1 credit)
     let balance = billing::check_credits(
         &state.http_client,
@@ -118,10 +124,9 @@ pub async fn messages(
     let upstream_url = providers::provider_url(&resolved_model.provider);
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
-    let mut upstream_request_value = request_value.clone();
-    upstream_request_value["model"] = serde_json::Value::String(
-        resolved_model.upstream_model.to_string(),
-    );
+    let upstream_request_value =
+        anthropic_compat::request_to_upstream(provider, resolved_model.upstream_model, &request_value)
+            .map_err(AppError::BadRequest)?;
     let upstream_body = serde_json::to_vec(&upstream_request_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
@@ -192,9 +197,13 @@ async fn handle_non_streaming(
         .await
         .map_err(|e| AppError::ProviderError(format!("Failed to read provider response: {e}")))?;
 
-    // Extract token counts and content from response
-    let response_value: serde_json::Value =
-        serde_json::from_slice(&response_bytes).unwrap_or_default();
+    let upstream_value: serde_json::Value = serde_json::from_slice(&response_bytes)
+        .map_err(|e| AppError::ProviderError(format!("Provider returned invalid JSON: {e}")))?;
+    let response_value =
+        anthropic_compat::response_from_upstream(provider_from_name(provider_name), model, &upstream_value)
+            .map_err(AppError::ProviderError)?;
+    let normalized_response_bytes = serde_json::to_vec(&response_value)
+        .map_err(|e| AppError::Internal(format!("Failed to encode normalized response: {e}")))?;
 
     let input_tokens = response_value
         .pointer("/usage/input_tokens")
@@ -282,7 +291,7 @@ async fn handle_non_streaming(
                 max_tokens.to_string(),
             ),
         ],
-        Body::from(response_bytes),
+        Body::from(normalized_response_bytes),
     )
         .into_response())
 }
@@ -367,6 +376,13 @@ async fn handle_streaming(
         body,
     )
         .into_response())
+}
+
+fn provider_from_name(provider_name: &str) -> providers::Provider {
+    match provider_name {
+        "openai" => providers::Provider::OpenAi,
+        _ => providers::Provider::Anthropic,
+    }
 }
 
 /// Fire-and-forget tasks: debit z-billing + record to aura-network.

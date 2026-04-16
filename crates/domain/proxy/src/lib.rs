@@ -1,3 +1,4 @@
+pub mod anthropic_compat;
 pub mod billing;
 pub mod image_gen;
 pub mod providers;
