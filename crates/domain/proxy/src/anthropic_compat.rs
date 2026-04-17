@@ -42,6 +42,23 @@ pub fn response_from_upstream(
     }
 }
 
+pub fn extract_last_user_text(request: &Value) -> String {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rfind(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .map(|message| flatten_anthropic_content_text(message.get("content")))
+        .unwrap_or_default()
+}
+
+pub fn extract_response_text(response: &Value) -> String {
+    flatten_anthropic_content_text(response.get("content"))
+}
+
 fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<Value, String> {
     let mut messages = Vec::new();
 
@@ -65,14 +82,11 @@ fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| "Anthropic message is missing role".to_string())?;
-        let blocks = message
-            .get("content")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "Anthropic message is missing content array".to_string())?;
+        let blocks = message_content_blocks(message.get("content"))?;
 
         match role {
-            "user" => append_user_messages(blocks, &mut messages),
-            "assistant" => messages.push(build_assistant_message(blocks)),
+            "user" => append_user_messages(&blocks, &mut messages),
+            "assistant" => messages.push(build_assistant_message(&blocks)),
             other => return Err(format!("Unsupported Anthropic role `{other}`")),
         }
     }
@@ -190,10 +204,25 @@ fn validate_message_blocks(messages: Option<&Value>) -> Result<(), String> {
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("Anthropic message {message_index} is missing role"))?;
-        let blocks = message
-            .get("content")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("Anthropic message {message_index} is missing content array"))?;
+        if !matches!(role, "user" | "assistant") {
+            return Err(format!(
+                "OpenAI-backed Aura models do not support Anthropic role `{role}`"
+            ));
+        }
+        let blocks = match message.get("content") {
+            Some(Value::String(_)) => continue,
+            Some(Value::Array(blocks)) => blocks,
+            Some(_) => {
+                return Err(format!(
+                    "Anthropic message {message_index} content must be a string or content array"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "Anthropic message {message_index} is missing content"
+                ));
+            }
+        };
 
         for block in blocks {
             let block_type = block
@@ -203,11 +232,7 @@ fn validate_message_blocks(messages: Option<&Value>) -> Result<(), String> {
             let supported = match role {
                 "user" => matches!(block_type, "text" | "image" | "tool_result"),
                 "assistant" => matches!(block_type, "text" | "tool_use"),
-                other => {
-                    return Err(format!(
-                        "OpenAI-backed Aura models do not support Anthropic role `{other}`"
-                    ));
-                }
+                _ => false,
             };
 
             if !supported {
@@ -451,14 +476,52 @@ fn extract_openai_text(content: Option<&Value>) -> Option<String> {
     }
 }
 
+fn message_content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
+    match content {
+        Some(Value::Array(blocks)) => Ok(blocks.clone()),
+        Some(Value::String(text)) => Ok(vec![json!({
+            "type": "text",
+            "text": text,
+        })]),
+        Some(_) => Err("Anthropic message content must be a string or content array".to_string()),
+        None => Err("Anthropic message is missing content".to_string()),
+    }
+}
+
+fn flatten_anthropic_content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(extract_text_from_block)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+fn extract_text_from_block(block: &Value) -> Option<String> {
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            block
+                .pointer("/text/value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn flatten_text_blocks(value: &Value) -> String {
     match value {
         Value::String(text) => text.trim().to_string(),
         Value::Array(blocks) => blocks
             .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .map(str::trim)
+            .filter_map(extract_text_from_block)
+            .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n\n"),
@@ -469,6 +532,14 @@ fn flatten_text_blocks(value: &Value) -> String {
 fn stringify_tool_result_content(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(_)) => {
+            let text = flatten_anthropic_content_text(content);
+            if text.is_empty() {
+                serde_json::to_string(content.unwrap_or(&Value::Null)).unwrap_or_default()
+            } else {
+                text
+            }
+        }
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
         None => String::new(),
     }
@@ -476,7 +547,10 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_to_upstream, response_from_upstream, validate_request};
+    use super::{
+        extract_last_user_text, extract_response_text, request_to_upstream, response_from_upstream,
+        validate_request,
+    };
     use crate::providers::Provider;
     use serde_json::json;
 
@@ -597,5 +671,69 @@ mod tests {
 
         let error = validate_request(Provider::OpenAi, &request).expect_err("request should fail");
         assert!(error.contains("do not support `thinking` blocks"));
+    }
+
+    #[test]
+    fn translates_string_shorthand_messages_for_openai_requests() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello from shorthand"
+                },
+                {
+                    "role": "assistant",
+                    "content": "Partial answer"
+                }
+            ]
+        });
+
+        let translated =
+            request_to_upstream(Provider::OpenAi, "gpt-4.1", &request).expect("translation");
+
+        assert_eq!(translated["messages"][0]["role"], "user");
+        assert_eq!(translated["messages"][0]["content"], "Hello from shorthand");
+        assert_eq!(translated["messages"][1]["role"], "assistant");
+        assert_eq!(translated["messages"][1]["content"], "Partial answer");
+    }
+
+    #[test]
+    fn extracts_last_user_text_from_string_and_block_content() {
+        let request = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Earlier"
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Reply"}]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Latest"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+                        {"type": "text", "text": "Question"}
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(extract_last_user_text(&request), "Latest\n\nQuestion");
+    }
+
+    #[test]
+    fn extracts_response_text_from_text_blocks() {
+        let response = json!({
+            "content": [
+                {"type": "text", "text": "First"},
+                {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "aura"}},
+                {"type": "text", "text": "Second"}
+            ]
+        });
+
+        assert_eq!(extract_response_text(&response), "First\n\nSecond");
     }
 }

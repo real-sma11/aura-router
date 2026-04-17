@@ -93,16 +93,7 @@ pub async fn messages(
     let session_ctx = storage::SessionContext::from_headers(&headers);
 
     // Extract user content from the request for storage (last user message)
-    let user_content = request_value
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .and_then(|msgs| {
-            msgs.iter()
-                .rfind(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        })
-        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-        .unwrap_or("")
-        .to_string();
+    let user_content = anthropic_compat::extract_last_user_text(&request_value);
 
     // [ENRICHMENT HOOK — v1: pass-through, future: RAG/memory/prompt modification]
 
@@ -238,17 +229,7 @@ async fn handle_non_streaming(
         if let (Some(ref storage_url), Some(ref storage_token)) =
             (&state.aura_storage_url, &state.aura_storage_token)
         {
-            let assistant_content = response_value
-                .get("content")
-                .and_then(|v| v.as_array())
-                .and_then(|blocks| {
-                    blocks
-                        .iter()
-                        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                        .and_then(|b| b.get("text").and_then(|t| t.as_str()))
-                })
-                .unwrap_or("")
-                .to_string();
+            let assistant_content = anthropic_compat::extract_response_text(&response_value);
 
             let client = state.http_client.clone();
             let url = storage_url.clone();
