@@ -369,6 +369,7 @@ async fn handle_streaming(
 fn provider_from_name(provider_name: &str) -> providers::Provider {
     match provider_name {
         "openai" => providers::Provider::OpenAi,
+        "fireworks" => providers::Provider::Fireworks,
         _ => providers::Provider::Anthropic,
     }
 }
@@ -444,5 +445,166 @@ fn spawn_post_request_tasks(
             )
             .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{router, state::AppState};
+    use aura_router_auth::{InternalToken, TokenValidator};
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    const SELF_SIGNED_KID: &str =
+        "jFNXMnFjGrSoDafnLQBohoCNalWcFcTjnKEbkRzWFBHyYJFikdLMHP";
+
+    #[derive(Debug, Serialize)]
+    struct TestClaims {
+        id: String,
+    }
+
+    async fn start_mock_billing() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/v1/usage/check",
+                post(|| async {
+                    Json(json!({
+                        "sufficient": true,
+                        "balance_cents": 1_000_000,
+                        "required_cents": 1,
+                    }))
+                }),
+            )
+            .route(
+                "/v1/usage",
+                post(|| async {
+                    Json(json!({
+                        "success": true,
+                        "balance_cents": 999_999,
+                        "cost_cents": 1,
+                        "transaction_id": "txn_test",
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (url, handle)
+    }
+
+    fn test_jwt(secret: &str, user_id: &str) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(SELF_SIGNED_KID.to_string());
+        encode(
+            &header,
+            &TestClaims {
+                id: user_id.to_string(),
+            },
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("test jwt")
+    }
+
+    #[tokio::test]
+    async fn fireworks_live_smoke_for_aura_managed_model() {
+        let Some(fireworks_api_key) = std::env::var("FIREWORKS_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping Fireworks live smoke test because FIREWORKS_API_KEY is missing");
+            return;
+        };
+
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-fireworks-smoke");
+        let (billing_url, _billing_handle) = start_mock_billing().await;
+
+        let state = AppState {
+            validator: TokenValidator::new(
+                "example.auth0.test".to_string(),
+                "aura-router-tests".to_string(),
+                cookie_secret.to_string(),
+            ),
+            internal_token: InternalToken("internal-test-token".to_string()),
+            http_client: reqwest::Client::new(),
+            rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
+                120, 60,
+            )),
+            anthropic_api_key: "unused".to_string(),
+            openai_api_key: None,
+            fireworks_api_key: Some(fireworks_api_key),
+            google_api_key: None,
+            tripo_api_key: None,
+            z_billing_url: billing_url,
+            z_billing_api_key: "billing-test-key".to_string(),
+            aura_network_url: None,
+            aura_network_token: None,
+            aura_storage_url: None,
+            aura_storage_token: None,
+            s3_config: None,
+            watermark_bytes: None,
+        };
+
+        let app = router::create_router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-deepseek-v3-2",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Reply with exactly FIREWORKS_OK and nothing else."
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("normalized anthropic response");
+        assert_eq!(response["model"], "aura-deepseek-v3-2");
+        let text = response["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("FIREWORKS_OK"),
+            "expected live Fireworks response to contain FIREWORKS_OK, got: {text}"
+        );
     }
 }

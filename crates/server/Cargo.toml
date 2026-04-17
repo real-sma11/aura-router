@@ -28,3 +28,6 @@ bytes = { workspace = true }
 futures-util = { workspace = true }
 base64 = { workspace = true }
 async-stream = { workspace = true }
+
+[dev-dependencies]
+jsonwebtoken = { workspace = true }

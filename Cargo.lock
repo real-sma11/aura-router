@@ -190,6 +190,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "jsonwebtoken",
  "reqwest",
  "serde",
  "serde_json",
