@@ -142,6 +142,8 @@ pub fn provider_url(provider: &Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "https://api.anthropic.com/v1/messages",
         Provider::OpenAi => "https://api.openai.com/v1/chat/completions",
+        // Intentionally use the stateless chat completions path for Aura's OSS lane.
+        // Aura Router centrally avoids Fireworks surfaces that can retain conversation state.
         Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
     }
 }

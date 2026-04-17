@@ -5,7 +5,11 @@ use crate::providers::Provider;
 pub fn validate_request(provider: Provider, request: &Value) -> Result<(), String> {
     match provider {
         Provider::Anthropic => Ok(()),
-        Provider::OpenAi | Provider::Fireworks => validate_openai_request(request),
+        Provider::OpenAi => validate_openai_request(request),
+        Provider::Fireworks => {
+            validate_openai_request(request)?;
+            validate_fireworks_privacy_policy(request)
+        }
     }
 }
 
@@ -186,6 +190,24 @@ fn validate_openai_request(request: &Value) -> Result<(), String> {
 
     validate_system_blocks(request.get("system"))?;
     validate_message_blocks(request.get("messages"))?;
+
+    Ok(())
+}
+
+fn validate_fireworks_privacy_policy(request: &Value) -> Result<(), String> {
+    if request.get("store").is_some() {
+        return Err(
+            "Fireworks-backed Aura models do not allow request-level persistence controls on /v1/messages; Aura Router enforces the non-stored inference path centrally"
+                .to_string(),
+        );
+    }
+
+    if request.get("response_id").is_some() {
+        return Err(
+            "Fireworks-backed Aura models do not support response-state replay on /v1/messages; Aura Router uses stateless inference for privacy"
+                .to_string(),
+        );
+    }
 
     Ok(())
 }
@@ -692,6 +714,38 @@ mod tests {
 
         let error = validate_request(Provider::OpenAi, &request).expect_err("request should fail");
         assert!(error.contains("do not support `thinking` blocks"));
+    }
+
+    #[test]
+    fn rejects_fireworks_requests_with_store_flag() {
+        let request = json!({
+            "model": "aura-deepseek-v3-2",
+            "store": true,
+            "messages": [{
+                "role": "user",
+                "content": "Hello"
+            }]
+        });
+
+        let error =
+            validate_request(Provider::Fireworks, &request).expect_err("request should fail");
+        assert!(error.contains("do not allow request-level persistence controls"));
+    }
+
+    #[test]
+    fn rejects_fireworks_requests_with_response_state_replay() {
+        let request = json!({
+            "model": "aura-deepseek-v3-2",
+            "response_id": "resp_123",
+            "messages": [{
+                "role": "user",
+                "content": "Hello"
+            }]
+        });
+
+        let error =
+            validate_request(Provider::Fireworks, &request).expect_err("request should fail");
+        assert!(error.contains("stateless inference for privacy"));
     }
 
     #[test]
