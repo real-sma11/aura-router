@@ -551,6 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_live_smoke_for_aura_managed_model() {
+        dotenvy::dotenv().ok();
         let Some(anthropic_api_key) = std::env::var("ANTHROPIC_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -630,6 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn fireworks_live_smoke_for_aura_managed_model() {
+        dotenvy::dotenv().ok();
         let Some(fireworks_api_key) = std::env::var("FIREWORKS_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
