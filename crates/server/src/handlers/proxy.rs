@@ -148,6 +148,7 @@ pub async fn messages(
             auth,
             state,
             requested_model,
+            provider,
             provider_name,
             upstream_resp,
             session_ctx,
@@ -283,6 +284,7 @@ async fn handle_streaming(
     auth: AuthUser,
     state: AppState,
     model: &str,
+    provider: providers::Provider,
     provider_name: &str,
     upstream_resp: reqwest::Response,
     session_ctx: Option<storage::SessionContext>,
@@ -291,7 +293,7 @@ async fn handle_streaming(
 ) -> Result<Response, AppError> {
     let model_owned = model.to_string();
     let provider_owned = provider_name.to_string();
-    let (tee_stream, usage_rx) = stream::proxy_stream(upstream_resp);
+    let (tee_stream, usage_rx) = stream::proxy_stream(provider, model, upstream_resp);
 
     // Spawn task to handle billing + storage after stream completes
     let billing_state = state.clone();

@@ -104,6 +104,36 @@ fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<
         upstream["temperature"] = Value::from(temperature);
     }
 
+    if let Some(top_p) = request.get("top_p").and_then(Value::as_f64) {
+        upstream["top_p"] = Value::from(top_p);
+    }
+
+    if let Some(stop_sequences) = request.get("stop_sequences").and_then(Value::as_array) {
+        let stops = stop_sequences
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| Value::String(value.to_string()))
+            .collect::<Vec<_>>();
+        if !stops.is_empty() {
+            upstream["stop"] = Value::Array(stops);
+        }
+    }
+
+    let is_streaming = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_streaming {
+        upstream["stream"] = Value::Bool(true);
+        let mut stream_options = request
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        stream_options.insert("include_usage".to_string(), Value::Bool(true));
+        upstream["stream_options"] = Value::Object(stream_options);
+    }
+
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
         if !tools.is_empty() {
             upstream["tools"] = Value::Array(
@@ -145,17 +175,6 @@ fn anthropic_request_to_openai(request: &Value, upstream_model: &str) -> Result<
 }
 
 fn validate_openai_request(request: &Value) -> Result<(), String> {
-    if request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(
-            "Streaming for OpenAI-backed Aura models is not supported on /v1/messages yet"
-                .to_string(),
-        );
-    }
-
     if request.get("thinking").is_some() {
         return Err(
             "OpenAI-backed Aura models do not support Anthropic thinking on /v1/messages yet"
@@ -552,7 +571,7 @@ mod tests {
         validate_request,
     };
     use crate::providers::Provider;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn translates_anthropic_request_to_openai_tools_format() {
@@ -696,6 +715,30 @@ mod tests {
         assert_eq!(translated["messages"][0]["content"], "Hello from shorthand");
         assert_eq!(translated["messages"][1]["role"], "assistant");
         assert_eq!(translated["messages"][1]["content"], "Partial answer");
+    }
+
+    #[test]
+    fn forwards_streaming_and_high_value_compat_fields_for_openai_requests() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "stream": true,
+            "top_p": 0.9,
+            "stop_sequences": ["DONE", "STOP"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello"
+                }
+            ]
+        });
+
+        let translated =
+            request_to_upstream(Provider::OpenAi, "gpt-4.1", &request).expect("translation");
+
+        assert_eq!(translated["stream"], Value::Bool(true));
+        assert_eq!(translated["stream_options"]["include_usage"], Value::Bool(true));
+        assert_eq!(translated["top_p"], json!(0.9));
+        assert_eq!(translated["stop"], json!(["DONE", "STOP"]));
     }
 
     #[test]
