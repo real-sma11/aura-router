@@ -290,6 +290,39 @@ fn validate_message_blocks(messages: Option<&Value>) -> Result<(), String> {
 }
 
 fn append_user_messages(blocks: &[Value], messages: &mut Vec<Value>) {
+    if blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    {
+        append_mixed_user_and_tool_result_messages(blocks, messages);
+        return;
+    }
+
+    append_non_tool_user_message(blocks, messages);
+}
+
+fn append_mixed_user_and_tool_result_messages(blocks: &[Value], messages: &mut Vec<Value>) {
+    let mut user_blocks = Vec::new();
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_result") => {
+                let content = stringify_tool_result_content(block.get("content"));
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                    "content": content,
+                }));
+            }
+            Some("text") | Some("image") => user_blocks.push(block.clone()),
+            _ => {}
+        }
+    }
+
+    append_non_tool_user_message(&user_blocks, messages);
+}
+
+fn append_non_tool_user_message(blocks: &[Value], messages: &mut Vec<Value>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut rich_parts: Vec<Value> = Vec::new();
     let mut has_images = false;
@@ -329,15 +362,6 @@ fn append_user_messages(blocks: &[Value], messages: &mut Vec<Value>) {
                     "image_url": {
                         "url": format!("data:{media_type};base64,{data}")
                     }
-                }));
-            }
-            Some("tool_result") => {
-                push_pending_user_message(&mut text_parts, &mut rich_parts, has_images, messages);
-                let content = stringify_tool_result_content(block.get("content"));
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
-                    "content": content,
                 }));
             }
             _ => {}
@@ -650,6 +674,58 @@ mod tests {
     }
 
     #[test]
+    fn translates_mixed_tool_results_before_follow_up_user_content() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "search_repo",
+                        "input": {"query": "aura"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Here is the screenshot."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "media_type": "image/png",
+                                "data": "ZmFrZQ=="
+                            }
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "text", "text": "repo found"}]
+                        },
+                        {"type": "text", "text": "Please summarize it."}
+                    ]
+                }
+            ]
+        });
+
+        let translated =
+            request_to_upstream(Provider::OpenAi, "gpt-4.1", &request).expect("translation");
+        let messages = translated["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+        assert_eq!(messages[1]["content"], "repo found");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "text");
+        assert_eq!(messages[2]["content"][0]["text"], "Here is the screenshot.");
+        assert_eq!(messages[2]["content"][1]["type"], "image_url");
+        assert_eq!(messages[2]["content"][2]["type"], "text");
+        assert_eq!(messages[2]["content"][2]["text"], "Please summarize it.");
+    }
+
+    #[test]
     fn translates_openai_response_to_anthropic_blocks() {
         let response = json!({
             "id": "chatcmpl_123",
@@ -792,7 +868,10 @@ mod tests {
             request_to_upstream(Provider::OpenAi, "gpt-4.1", &request).expect("translation");
 
         assert_eq!(translated["stream"], Value::Bool(true));
-        assert_eq!(translated["stream_options"]["include_usage"], Value::Bool(true));
+        assert_eq!(
+            translated["stream_options"]["include_usage"],
+            Value::Bool(true)
+        );
         assert_eq!(translated["top_p"], json!(0.9));
         assert_eq!(translated["stop"], json!(["DONE", "STOP"]));
     }

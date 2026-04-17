@@ -133,19 +133,13 @@ pub async fn messages(
         .map_err(|e| AppError::ProviderError(format!("Provider unreachable: {e}")))?;
 
     let upstream_status = upstream_resp.status();
+    let provider_name = provider.name();
 
-    // If provider returned an error, pass it through
+    // Normalize upstream failures into Anthropic-compatible error envelopes.
     if !upstream_status.is_success() {
         let error_body = upstream_resp.bytes().await.unwrap_or_default();
-        return Ok((
-            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            [(header::CONTENT_TYPE, "application/json")],
-            Body::from(error_body),
-        )
-            .into_response());
+        return Ok(normalize_upstream_error(upstream_status, &error_body));
     }
-
-    let provider_name = provider.name();
 
     if is_streaming {
         return handle_streaming(
@@ -374,6 +368,66 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
     }
 }
 
+fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
+    let message = extract_upstream_error_message(error_body)
+        .unwrap_or_else(|| format!("Upstream provider returned HTTP {}", status.as_u16()));
+
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json".to_string())],
+        Body::from(
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": anthropic_error_type(status),
+                    "message": message,
+                }
+            })
+            .to_string(),
+        ),
+    )
+        .into_response()
+}
+
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        status if status.as_u16() == 529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+fn extract_upstream_error_message(error_body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(error_body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    value
+                        .pointer("/message")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .or_else(|| value.pointer("/error").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            std::str::from_utf8(error_body)
+                .ok()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        })
+}
+
 /// Fire-and-forget tasks: debit z-billing + record to aura-network.
 fn spawn_post_request_tasks(
     state: &AppState,
@@ -462,8 +516,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
-    const SELF_SIGNED_KID: &str =
-        "jFNXMnFjGrSoDafnLQBohoCNalWcFcTjnKEbkRzWFBHyYJFikdLMHP";
+    const SELF_SIGNED_KID: &str = "jFNXMnFjGrSoDafnLQBohoCNalWcFcTjnKEbkRzWFBHyYJFikdLMHP";
 
     #[derive(Debug, Serialize)]
     struct TestClaims {
@@ -551,6 +604,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalizes_upstream_json_errors_to_anthropic_shape() {
+        let response = super::normalize_upstream_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"tools[0] is invalid"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "tools[0] is invalid");
+    }
+
+    #[tokio::test]
+    async fn normalizes_unparseable_upstream_errors_without_passthrough() {
+        let response = super::normalize_upstream_error(StatusCode::BAD_GATEWAY, b"");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Upstream provider returned HTTP 502"
+        );
+    }
+
+    #[tokio::test]
     async fn anthropic_live_smoke_for_aura_managed_model() {
         dotenvy::dotenv().ok();
         let Some(anthropic_api_key) = std::env::var("ANTHROPIC_API_KEY")
@@ -622,11 +713,17 @@ mod tests {
             "expected live Anthropic response to contain ANTHROPIC_OK, got: {text}"
         );
         assert!(
-            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected Anthropic input token count to be populated: {response}"
         );
         assert!(
-            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["output_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected Anthropic output token count to be populated: {response}"
         );
     }
@@ -703,11 +800,17 @@ mod tests {
             "expected live OpenAI response to contain OPENAI_OK, got: {text}"
         );
         assert!(
-            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected OpenAI input token count to be populated: {response}"
         );
         assert!(
-            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["output_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected OpenAI output token count to be populated: {response}"
         );
     }
@@ -784,11 +887,17 @@ mod tests {
             "expected live Fireworks response to contain FIREWORKS_OK, got: {text}"
         );
         assert!(
-            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected Fireworks input token count to be populated: {response}"
         );
         assert!(
-            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            response["usage"]["output_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
             "expected Fireworks output token count to be populated: {response}"
         );
     }
