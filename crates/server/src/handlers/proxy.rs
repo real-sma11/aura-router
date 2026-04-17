@@ -579,7 +579,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "model": "aura-claude-haiku-4-5",
+                    "model": "aura-claude-sonnet-4-6",
                     "max_tokens": 32,
                     "temperature": 0,
                     "messages": [
@@ -606,7 +606,7 @@ mod tests {
             .expect("response bytes");
         let response: serde_json::Value =
             serde_json::from_slice(&bytes).expect("normalized anthropic response");
-        assert_eq!(response["model"], "aura-claude-haiku-4-5");
+        assert_eq!(response["model"], "aura-claude-sonnet-4-6");
         let text = response["content"]
             .as_array()
             .and_then(|blocks| {
@@ -660,7 +660,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "model": "aura-gpt-4.1",
+                    "model": "aura-gpt-5-4-mini",
                     "max_tokens": 32,
                     "temperature": 0,
                     "messages": [
@@ -687,7 +687,7 @@ mod tests {
             .expect("response bytes");
         let response: serde_json::Value =
             serde_json::from_slice(&bytes).expect("normalized anthropic response");
-        assert_eq!(response["model"], "aura-gpt-4.1");
+        assert_eq!(response["model"], "aura-gpt-5-4-mini");
         let text = response["content"]
             .as_array()
             .and_then(|blocks| {
