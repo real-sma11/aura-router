@@ -104,6 +104,10 @@ pub async fn messages(
             .openai_api_key
             .clone()
             .ok_or_else(|| AppError::BadRequest("OpenAI provider not configured".into()))?,
+        providers::Provider::Fireworks => state
+            .fireworks_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("Fireworks provider not configured".into()))?,
     };
 
     // Forward to provider

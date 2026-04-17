@@ -140,7 +140,9 @@ impl StreamAdapter {
             Provider::Anthropic => Self::Anthropic(AnthropicPassthrough {
                 parser: SseParser::new(),
             }),
-            Provider::OpenAi => Self::OpenAi(OpenAiCompatStream::new(requested_model)),
+            Provider::OpenAi | Provider::Fireworks => {
+                Self::OpenAi(OpenAiCompatStream::new(requested_model))
+            }
         }
     }
 

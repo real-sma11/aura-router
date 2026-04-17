@@ -5,7 +5,7 @@ use crate::providers::Provider;
 pub fn validate_request(provider: Provider, request: &Value) -> Result<(), String> {
     match provider {
         Provider::Anthropic => Ok(()),
-        Provider::OpenAi => validate_openai_request(request),
+        Provider::OpenAi | Provider::Fireworks => validate_openai_request(request),
     }
 }
 
@@ -20,7 +20,7 @@ pub fn request_to_upstream(
             next["model"] = Value::String(upstream_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi => {
+        Provider::OpenAi | Provider::Fireworks => {
             validate_openai_request(request)?;
             anthropic_request_to_openai(request, upstream_model)
         }
@@ -38,7 +38,9 @@ pub fn response_from_upstream(
             next["model"] = Value::String(requested_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi => openai_response_to_anthropic(response, requested_model),
+        Provider::OpenAi | Provider::Fireworks => {
+            openai_response_to_anthropic(response, requested_model)
+        }
     }
 }
 

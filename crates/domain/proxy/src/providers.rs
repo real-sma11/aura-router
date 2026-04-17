@@ -7,6 +7,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 pub enum Provider {
     Anthropic,
     OpenAi,
+    Fireworks,
 }
 
 impl Provider {
@@ -15,6 +16,7 @@ impl Provider {
         match self {
             Provider::Anthropic => "anthropic",
             Provider::OpenAi => "openai",
+            Provider::Fireworks => "fireworks",
         }
     }
 }
@@ -58,6 +60,16 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "o4-mini",
             provider: Provider::OpenAi,
         }),
+        "aura-deepseek-v3-2" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/deepseek-v3p2",
+            provider: Provider::Fireworks,
+        }),
+        "aura-qwen2-5-coder-7b" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/qwen2p5-coder-7b",
+            provider: Provider::Fireworks,
+        }),
         _ => None,
     }
 }
@@ -100,6 +112,7 @@ pub fn provider_url(provider: &Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "https://api.anthropic.com/v1/messages",
         Provider::OpenAi => "https://api.openai.com/v1/chat/completions",
+        Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
     }
 }
 
@@ -125,6 +138,9 @@ pub fn max_context_tokens(model: &str) -> u64 {
         m if m.starts_with("o3") => 200_000,
         m if m.starts_with("o4") => 200_000,
         m if m.starts_with("codex") => 200_000,
+        // Fireworks OSS
+        "accounts/fireworks/models/deepseek-v3p2" => 163_840,
+        "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
         _ => 200_000, // safe default
     }
 }
@@ -144,6 +160,12 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
             );
         }
         Provider::OpenAi => {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_str(&format!("Bearer {api_key}")).ok()?,
+            );
+        }
+        Provider::Fireworks => {
             headers.insert(
                 "authorization",
                 HeaderValue::from_str(&format!("Bearer {api_key}")).ok()?,
@@ -177,5 +199,9 @@ mod tests {
     #[test]
     fn resolve_provider_understands_aura_aliases() {
         assert_eq!(resolve_provider("aura-gpt-4.1"), Some(Provider::OpenAi));
+        assert_eq!(
+            resolve_provider("aura-deepseek-v3-2"),
+            Some(Provider::Fireworks)
+        );
     }
 }

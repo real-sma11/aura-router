@@ -14,6 +14,7 @@ pub struct AppState {
     // Provider API keys
     pub anthropic_api_key: String,
     pub openai_api_key: Option<String>,
+    pub fireworks_api_key: Option<String>,
     pub google_api_key: Option<String>,
     pub tripo_api_key: Option<String>,
 
