@@ -516,6 +516,118 @@ mod tests {
         .expect("test jwt")
     }
 
+    fn test_state(
+        cookie_secret: &str,
+        billing_url: String,
+        anthropic_api_key: String,
+        fireworks_api_key: Option<String>,
+    ) -> AppState {
+        AppState {
+            validator: TokenValidator::new(
+                "example.auth0.test".to_string(),
+                "aura-router-tests".to_string(),
+                cookie_secret.to_string(),
+            ),
+            internal_token: InternalToken("internal-test-token".to_string()),
+            http_client: reqwest::Client::new(),
+            rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
+                120, 60,
+            )),
+            anthropic_api_key,
+            openai_api_key: None,
+            fireworks_api_key,
+            google_api_key: None,
+            tripo_api_key: None,
+            z_billing_url: billing_url,
+            z_billing_api_key: "billing-test-key".to_string(),
+            aura_network_url: None,
+            aura_network_token: None,
+            aura_storage_url: None,
+            aura_storage_token: None,
+            s3_config: None,
+            watermark_bytes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_live_smoke_for_aura_managed_model() {
+        let Some(anthropic_api_key) = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping Anthropic live smoke test because ANTHROPIC_API_KEY is missing");
+            return;
+        };
+
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-anthropic-smoke");
+        let (billing_url, _billing_handle) = start_mock_billing().await;
+
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            anthropic_api_key,
+            None,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-claude-haiku-4-5",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Reply with exactly ANTHROPIC_OK and nothing else."
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("normalized anthropic response");
+        assert_eq!(response["model"], "aura-claude-haiku-4-5");
+        let text = response["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("ANTHROPIC_OK"),
+            "expected live Anthropic response to contain ANTHROPIC_OK, got: {text}"
+        );
+        assert!(
+            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected Anthropic input token count to be populated: {response}"
+        );
+        assert!(
+            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected Anthropic output token count to be populated: {response}"
+        );
+    }
+
     #[tokio::test]
     async fn fireworks_live_smoke_for_aura_managed_model() {
         let Some(fireworks_api_key) = std::env::var("FIREWORKS_API_KEY")
@@ -530,33 +642,12 @@ mod tests {
         let jwt = test_jwt(cookie_secret, "user-fireworks-smoke");
         let (billing_url, _billing_handle) = start_mock_billing().await;
 
-        let state = AppState {
-            validator: TokenValidator::new(
-                "example.auth0.test".to_string(),
-                "aura-router-tests".to_string(),
-                cookie_secret.to_string(),
-            ),
-            internal_token: InternalToken("internal-test-token".to_string()),
-            http_client: reqwest::Client::new(),
-            rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
-                120, 60,
-            )),
-            anthropic_api_key: "unused".to_string(),
-            openai_api_key: None,
-            fireworks_api_key: Some(fireworks_api_key),
-            google_api_key: None,
-            tripo_api_key: None,
-            z_billing_url: billing_url,
-            z_billing_api_key: "billing-test-key".to_string(),
-            aura_network_url: None,
-            aura_network_token: None,
-            aura_storage_url: None,
-            aura_storage_token: None,
-            s3_config: None,
-            watermark_bytes: None,
-        };
-
-        let app = router::create_router().with_state(state);
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            "unused".to_string(),
+            Some(fireworks_api_key),
+        ));
         let req = Request::builder()
             .method("POST")
             .uri("/v1/messages")
@@ -605,6 +696,14 @@ mod tests {
         assert!(
             text.contains("FIREWORKS_OK"),
             "expected live Fireworks response to contain FIREWORKS_OK, got: {text}"
+        );
+        assert!(
+            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected Fireworks input token count to be populated: {response}"
+        );
+        assert!(
+            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected Fireworks output token count to be populated: {response}"
         );
     }
 }
