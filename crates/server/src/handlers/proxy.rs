@@ -520,6 +520,7 @@ mod tests {
         cookie_secret: &str,
         billing_url: String,
         anthropic_api_key: String,
+        openai_api_key: Option<String>,
         fireworks_api_key: Option<String>,
     ) -> AppState {
         AppState {
@@ -534,7 +535,7 @@ mod tests {
                 120, 60,
             )),
             anthropic_api_key,
-            openai_api_key: None,
+            openai_api_key,
             fireworks_api_key,
             google_api_key: None,
             tripo_api_key: None,
@@ -568,6 +569,7 @@ mod tests {
             cookie_secret,
             billing_url,
             anthropic_api_key,
+            None,
             None,
         ));
         let req = Request::builder()
@@ -630,6 +632,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_live_smoke_for_aura_managed_model() {
+        dotenvy::dotenv().ok();
+        let Some(openai_api_key) = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping OpenAI live smoke test because OPENAI_API_KEY is missing");
+            return;
+        };
+
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-openai-smoke");
+        let (billing_url, _billing_handle) = start_mock_billing().await;
+
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            "unused".to_string(),
+            Some(openai_api_key),
+            None,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-gpt-4.1",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Reply with exactly OPENAI_OK and nothing else."
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("normalized anthropic response");
+        assert_eq!(response["model"], "aura-gpt-4.1");
+        let text = response["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("OPENAI_OK"),
+            "expected live OpenAI response to contain OPENAI_OK, got: {text}"
+        );
+        assert!(
+            response["usage"]["input_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected OpenAI input token count to be populated: {response}"
+        );
+        assert!(
+            response["usage"]["output_tokens"].as_u64().unwrap_or_default() > 0,
+            "expected OpenAI output token count to be populated: {response}"
+        );
+    }
+
+    #[tokio::test]
     async fn fireworks_live_smoke_for_aura_managed_model() {
         dotenvy::dotenv().ok();
         let Some(fireworks_api_key) = std::env::var("FIREWORKS_API_KEY")
@@ -648,6 +731,7 @@ mod tests {
             cookie_secret,
             billing_url,
             "unused".to_string(),
+            None,
             Some(fireworks_api_key),
         ));
         let req = Request::builder()
