@@ -51,6 +51,8 @@ pub async fn generate_image(
         &state.z_billing_api_key,
         &auth.user_id,
         26, // image generation minimum: 26 credits ($0.26)
+        None,
+        None,
     )
     .await?;
 
@@ -260,6 +262,8 @@ pub async fn generate_image_stream(
         &state.z_billing_api_key,
         &auth.user_id,
         100,
+        None,
+        None,
     )
     .await?;
 

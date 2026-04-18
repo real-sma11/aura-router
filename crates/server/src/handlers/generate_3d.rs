@@ -48,6 +48,8 @@ pub async fn generate_3d(
         &state.z_billing_api_key,
         &auth.user_id,
         50,
+        None,
+        None,
     )
     .await?;
 
@@ -197,6 +199,8 @@ pub async fn generate_3d_stream(
         &state.z_billing_api_key,
         &auth.user_id,
         50,
+        None,
+        None,
     )
     .await?;
 

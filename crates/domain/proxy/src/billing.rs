@@ -39,17 +39,26 @@ pub async fn check_credits(
     api_key: &str,
     user_id: &str,
     required_cents: i64,
+    provider: Option<&str>,
+    model: Option<&str>,
 ) -> Result<CheckBalanceResponse, AppError> {
     let url = format!("{billing_url}/v1/usage/check");
+    let mut request_body = serde_json::json!({
+        "user_id": user_id,
+        "required_cents": required_cents
+    });
+    if let Some(provider) = provider {
+        request_body["provider"] = serde_json::Value::String(provider.to_string());
+    }
+    if let Some(model) = model {
+        request_body["model"] = serde_json::Value::String(model.to_string());
+    }
 
     let resp = client
         .post(&url)
         .header("x-api-key", api_key)
         .header("x-service-name", "aura-router")
-        .json(&serde_json::json!({
-            "user_id": user_id,
-            "required_cents": required_cents
-        }))
+        .json(&request_body)
         .send()
         .await
         .map_err(|e| AppError::BillingError(format!("z-billing unreachable: {e}")))?;

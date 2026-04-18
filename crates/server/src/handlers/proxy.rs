@@ -72,20 +72,22 @@ pub async fn messages(
     let provider = resolved_model.provider;
     anthropic_compat::validate_request(provider, &request_value).map_err(AppError::BadRequest)?;
 
-    // Pre-check credits (conservative minimum: 1 credit)
+    // Pre-check credits using the z-billing pricing table when possible.
     let balance = billing::check_credits(
         &state.http_client,
         &state.z_billing_url,
         &state.z_billing_api_key,
         &auth.user_id,
-        1,
+        0,
+        Some(provider.name()),
+        Some(requested_model),
     )
     .await?;
 
     if !balance.sufficient {
         return Err(AppError::InsufficientCredits {
             balance: balance.balance_cents,
-            required: 1,
+            required: balance.required_cents,
         });
     }
 
@@ -513,6 +515,7 @@ mod tests {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde::Serialize;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -554,6 +557,50 @@ mod tests {
             axum::serve(listener, app).await.ok();
         });
         (url, handle)
+    }
+
+    async fn start_recording_billing(
+        check_response: serde_json::Value,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let recorded_requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_check = Arc::clone(&recorded_requests);
+        let check_response_for_route = check_response.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1/usage/check",
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorded_for_check = Arc::clone(&recorded_for_check);
+                    let check_response = check_response_for_route.clone();
+                    async move {
+                        recorded_for_check.lock().unwrap().push(body);
+                        Json(check_response)
+                    }
+                }),
+            )
+            .route(
+                "/v1/usage",
+                post(|| async {
+                    Json(json!({
+                        "success": true,
+                        "balance_cents": 999_999,
+                        "cost_cents": 1,
+                        "transaction_id": "txn_test",
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (url, recorded_requests, handle)
     }
 
     fn test_jwt(secret: &str, user_id: &str) -> String {
@@ -620,6 +667,64 @@ mod tests {
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["message"], "tools[0] is invalid");
+    }
+
+    #[tokio::test]
+    async fn uses_requested_aura_model_for_model_aware_credit_check() {
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-credit-check");
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": false,
+            "balance_cents": 1,
+            "required_cents": 3,
+        }))
+        .await;
+
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            "unused".to_string(),
+            Some("unused".to_string()),
+            None,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-gpt-5-4",
+                    "max_tokens": 32,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "hello"}]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["required_cents"], 0);
+        assert_eq!(requests[0]["provider"], "openai");
+        assert_eq!(requests[0]["model"], "aura-gpt-5-4");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(response["error"]["code"], "INSUFFICIENT_CREDITS");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("required=3"));
     }
 
     #[tokio::test]
