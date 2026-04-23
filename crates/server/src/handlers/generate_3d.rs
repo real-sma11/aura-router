@@ -120,6 +120,7 @@ pub async fn generate_3d(
             let prompt = input.prompt.clone();
             let parent = input.parent_id.clone();
             let s3 = state.s3_config.clone();
+            let thumb = image_url.clone();
             tokio::spawn(async move {
                 match tripo::poll_task(&client, &api_key, &tid).await {
                     Ok(status) if status.status == "success" => {
@@ -169,6 +170,7 @@ pub async fn generate_3d(
                                 &uid,
                                 "model",
                                 &asset_url,
+                                Some(thumb.as_str()),
                                 None,
                                 name.as_deref(),
                                 prompt.as_deref(),
@@ -374,6 +376,7 @@ pub async fn generate_3d_stream(
                                 &gen_user_id,
                                 "model",
                                 glb_url,
+                                Some(image_url.as_str()),
                                 None,
                                 gen_name.as_deref(),
                                 gen_prompt.as_deref(),

@@ -144,6 +144,7 @@ pub async fn store_artifact(
     created_by: &str,
     artifact_type: &str,
     asset_url: &str,
+    thumbnail_url: Option<&str>,
     original_url: Option<&str>,
     name: Option<&str>,
     prompt: Option<&str>,
@@ -152,7 +153,7 @@ pub async fn store_artifact(
     provider: &str,
     is_iteration: bool,
     parent_id: Option<&str>,
-) {
+) -> Option<String> {
     let url = format!("{storage_url}/internal/artifacts");
 
     let result = client
@@ -163,6 +164,7 @@ pub async fn store_artifact(
             "createdBy": created_by,
             "type": artifact_type,
             "assetUrl": asset_url,
+            "thumbnailUrl": thumbnail_url,
             "originalUrl": original_url,
             "name": name,
             "prompt": prompt,
@@ -177,13 +179,22 @@ pub async fn store_artifact(
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            tracing::debug!("Artifact stored to aura-storage");
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                let id = body.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                tracing::debug!("Artifact stored to aura-storage");
+                id
+            } else {
+                tracing::debug!("Artifact stored but failed to parse response");
+                None
+            }
         }
         Ok(resp) => {
             tracing::warn!(status = %resp.status(), "Failed to store artifact");
+            None
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to reach aura-storage for artifact");
+            None
         }
     }
 }

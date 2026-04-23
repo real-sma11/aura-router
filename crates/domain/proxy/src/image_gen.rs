@@ -493,6 +493,8 @@ pub enum ImageStreamEvent {
         image_url: String,
         #[serde(rename = "originalUrl")]
         original_url: Option<String>,
+        #[serde(rename = "artifactId", skip_serializing_if = "Option::is_none")]
+        artifact_id: Option<String>,
         meta: ImageMeta,
     },
     #[serde(rename = "error")]

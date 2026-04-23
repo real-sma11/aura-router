@@ -197,6 +197,7 @@ pub async fn generate_image(
                     &uid,
                     "image",
                     &asset,
+                    None,
                     Some(&orig),
                     name.as_deref(),
                     Some(&prompt),
@@ -456,12 +457,13 @@ pub async fn generate_image_stream(
         )
         .await;
 
-        // Auto-store artifact
+        // Auto-store artifact and capture ID for the completed event
+        let mut artifact_id = None;
         if let Some(ref pid) = gen_project_id {
             if let (Some(ref surl), Some(ref stok)) =
                 (&gen_state.aura_storage_url, &gen_state.aura_storage_token)
             {
-                storage::store_artifact(
+                artifact_id = storage::store_artifact(
                     &gen_state.http_client,
                     surl,
                     stok,
@@ -469,6 +471,7 @@ pub async fn generate_image_stream(
                     &gen_user_id,
                     "image",
                     &image_url,
+                    None,
                     original_url.as_deref(),
                     gen_name.as_deref(),
                     Some(&gen_prompt),
@@ -486,6 +489,7 @@ pub async fn generate_image_stream(
             .send(image_gen::ImageStreamEvent::Completed {
                 image_url,
                 original_url,
+                artifact_id,
                 meta: image_gen::ImageMeta {
                     model: gen_model,
                     size: gen_size,
