@@ -124,29 +124,39 @@ pub async fn generate_3d(
                 match tripo::poll_task(&client, &api_key, &tid).await {
                     Ok(status) if status.status == "success" => {
                         if let Some(ref raw_glb_url) = status.glb_url {
-                            // Re-upload GLB to S3 for CORS-safe access
+                            // Re-upload GLB to S3 with retry — never store a raw Tripo URL.
+                            // Uses User-Agent header (required by Tripo CDN), 10s timeout, 50MB limit.
                             let asset_url = if let Some(ref s3) = s3 {
-                                match client.get(raw_glb_url).send().await {
-                                    Ok(resp) if resp.status().is_success() => {
-                                        match resp.bytes().await {
-                                            Ok(bytes) => s3
-                                                .upload_bytes(bytes.to_vec(), &uid, "model/gltf-binary", "glb")
-                                                .await
-                                                .unwrap_or_else(|e| {
-                                                    tracing::warn!(error = %e, "S3 GLB upload failed, using Tripo URL");
-                                                    raw_glb_url.clone()
-                                                }),
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "Failed to read GLB bytes");
-                                                raw_glb_url.clone()
-                                            }
+                                let mut result = None;
+                                for attempt in 1..=3u8 {
+                                    match async {
+                                        let resp = client.get(raw_glb_url)
+                                            .header("User-Agent", "Mozilla/5.0 (compatible; AuraBot/1.0)")
+                                            .timeout(std::time::Duration::from_secs(10))
+                                            .send().await
+                                            .map_err(|e| format!("download: {e}"))?;
+                                        if !resp.status().is_success() {
+                                            return Err(format!("download returned {}", resp.status()));
+                                        }
+                                        let bytes = resp.bytes().await
+                                            .map_err(|e| format!("bytes: {e}"))?;
+                                        if bytes.len() > 50 * 1024 * 1024 {
+                                            return Err(format!("GLB too large: {}MB", bytes.len() / 1024 / 1024));
+                                        }
+                                        s3.upload_bytes(bytes.to_vec(), &uid, "model/gltf-binary", "glb")
+                                            .await.map_err(|e| format!("S3: {e}"))
+                                    }.await {
+                                        Ok(url) => { result = Some(url); break; }
+                                        Err(e) => {
+                                            tracing::warn!(attempt, error = %e, "GLB S3 re-upload attempt failed");
+                                            if attempt < 3 { tokio::time::sleep(std::time::Duration::from_secs(2)).await; }
                                         }
                                     }
-                                    _ => {
-                                        tracing::warn!("Failed to download GLB from Tripo");
-                                        raw_glb_url.clone()
-                                    }
                                 }
+                                result.unwrap_or_else(|| {
+                                    tracing::error!("All S3 re-upload attempts failed, storing Tripo URL as fallback");
+                                    raw_glb_url.clone()
+                                })
                             } else {
                                 raw_glb_url.clone()
                             };
@@ -305,12 +315,57 @@ pub async fn generate_3d_stream(
 
         match tripo::poll_task(&gen_state.http_client, &tripo_api_key, &task_id).await {
             Ok(status) if status.status == "success" => {
-                // Auto-store artifact
-                if let Some(ref pid) = gen_project_id {
-                    if let (Some(ref surl), Some(ref stok)) =
-                        (&gen_state.aura_storage_url, &gen_state.aura_storage_token)
-                    {
-                        if let Some(ref glb_url) = status.glb_url {
+                // Re-upload GLB to S3 so the browser can load it (Tripo CDN lacks CORS headers).
+                // Uses User-Agent header (required by Tripo CDN), 10s timeout, and 50MB size limit
+                // matching old AURA's proven approach. Retry up to 3 times.
+                let final_glb_url = if let (Some(ref raw_url), Some(ref s3)) = (&status.glb_url, &gen_state.s3_config) {
+                    let mut s3_url = None;
+                    for attempt in 1..=3u8 {
+                        match async {
+                            let resp = gen_state.http_client
+                                .get(raw_url)
+                                .header("User-Agent", "Mozilla/5.0 (compatible; AuraBot/1.0)")
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await
+                                .map_err(|e| format!("download failed: {e}"))?;
+                            if !resp.status().is_success() {
+                                return Err(format!("download returned {}", resp.status()));
+                            }
+                            let bytes = resp.bytes().await
+                                .map_err(|e| format!("read bytes failed: {e}"))?;
+                            // 50MB limit for GLB files (matching old AURA)
+                            if bytes.len() > 50 * 1024 * 1024 {
+                                return Err(format!("GLB too large: {}MB", bytes.len() / 1024 / 1024));
+                            }
+                            s3.upload_bytes(bytes.to_vec(), &gen_user_id, "model/gltf-binary", "glb")
+                                .await
+                                .map_err(|e| format!("S3 upload failed: {e}"))
+                        }.await {
+                            Ok(url) => {
+                                s3_url = Some(url);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(attempt, error = %e, "GLB S3 re-upload attempt failed");
+                                if attempt < 3 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                            }
+                        }
+                    }
+                    s3_url
+                } else {
+                    // No S3 config — cannot re-upload
+                    None
+                };
+
+                if let Some(ref glb_url) = final_glb_url {
+                    // Store artifact with the S3 URL (not the raw Tripo URL)
+                    if let Some(ref pid) = gen_project_id {
+                        if let (Some(ref surl), Some(ref stok)) =
+                            (&gen_state.aura_storage_url, &gen_state.aura_storage_token)
+                        {
                             storage::store_artifact(
                                 &gen_state.http_client,
                                 surl,
@@ -331,45 +386,25 @@ pub async fn generate_3d_stream(
                             .await;
                         }
                     }
-                }
 
-                // Re-upload GLB to S3 so the browser can load it (Tripo CDN lacks CORS headers).
-                let final_glb_url = if let (Some(ref raw_url), Some(ref s3)) = (&status.glb_url, &gen_state.s3_config) {
-                    match gen_state.http_client.get(raw_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
-                                Ok(bytes) => {
-                                    match s3.upload_bytes(bytes.to_vec(), &gen_user_id, "model/gltf-binary", "glb").await {
-                                        Ok(s3_url) => Some(s3_url),
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "Failed to upload GLB to S3, using Tripo URL");
-                                            status.glb_url.clone()
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Failed to read GLB bytes, using Tripo URL");
-                                    status.glb_url.clone()
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!("Failed to download GLB from Tripo, using raw URL");
-                            status.glb_url.clone()
-                        }
-                    }
+                    let _ = event_tx
+                        .send(serde_json::json!({
+                            "type": "completed",
+                            "taskId": task_id,
+                            "glbUrl": glb_url,
+                            "polyCount": status.poly_count,
+                        }))
+                        .await;
                 } else {
-                    status.glb_url.clone()
-                };
-
-                let _ = event_tx
-                    .send(serde_json::json!({
-                        "type": "completed",
-                        "taskId": task_id,
-                        "glbUrl": final_glb_url,
-                        "polyCount": status.poly_count,
-                    }))
-                    .await;
+                    tracing::error!("All S3 re-upload attempts failed for task {task_id}");
+                    let _ = event_tx
+                        .send(serde_json::json!({
+                            "type": "error",
+                            "code": "S3_UPLOAD_FAILED",
+                            "message": "3D model generated but failed to upload for viewing. Please try again.",
+                        }))
+                        .await;
+                }
             }
             Ok(status) => {
                 let _ = event_tx
