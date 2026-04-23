@@ -104,7 +104,7 @@ pub async fn generate_3d(
         });
     }
 
-    // Background: poll for completion and auto-store artifact
+    // Background: poll for completion, re-upload GLB to S3, and store artifact
     if let Some(ref project_id) = input.project_id {
         if let (Some(ref storage_url), Some(ref storage_token)) =
             (&state.aura_storage_url, &state.aura_storage_token)
@@ -119,10 +119,38 @@ pub async fn generate_3d(
             let name = input.name.clone();
             let prompt = input.prompt.clone();
             let parent = input.parent_id.clone();
+            let s3 = state.s3_config.clone();
             tokio::spawn(async move {
                 match tripo::poll_task(&client, &api_key, &tid).await {
                     Ok(status) if status.status == "success" => {
-                        if let Some(ref glb_url) = status.glb_url {
+                        if let Some(ref raw_glb_url) = status.glb_url {
+                            // Re-upload GLB to S3 for CORS-safe access
+                            let asset_url = if let Some(ref s3) = s3 {
+                                match client.get(raw_glb_url).send().await {
+                                    Ok(resp) if resp.status().is_success() => {
+                                        match resp.bytes().await {
+                                            Ok(bytes) => s3
+                                                .upload_bytes(bytes.to_vec(), &uid, "model/gltf-binary", "glb")
+                                                .await
+                                                .unwrap_or_else(|e| {
+                                                    tracing::warn!(error = %e, "S3 GLB upload failed, using Tripo URL");
+                                                    raw_glb_url.clone()
+                                                }),
+                                            Err(e) => {
+                                                tracing::warn!(error = %e, "Failed to read GLB bytes");
+                                                raw_glb_url.clone()
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        tracing::warn!("Failed to download GLB from Tripo");
+                                        raw_glb_url.clone()
+                                    }
+                                }
+                            } else {
+                                raw_glb_url.clone()
+                            };
+
                             storage::store_artifact(
                                 &client,
                                 &surl,
@@ -130,7 +158,7 @@ pub async fn generate_3d(
                                 &pid,
                                 &uid,
                                 "model",
-                                glb_url,
+                                &asset_url,
                                 None,
                                 name.as_deref(),
                                 prompt.as_deref(),
@@ -305,11 +333,40 @@ pub async fn generate_3d_stream(
                     }
                 }
 
+                // Re-upload GLB to S3 so the browser can load it (Tripo CDN lacks CORS headers).
+                let final_glb_url = if let (Some(ref raw_url), Some(ref s3)) = (&status.glb_url, &gen_state.s3_config) {
+                    match gen_state.http_client.get(raw_url).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    match s3.upload_bytes(bytes.to_vec(), &gen_user_id, "model/gltf-binary", "glb").await {
+                                        Ok(s3_url) => Some(s3_url),
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "Failed to upload GLB to S3, using Tripo URL");
+                                            status.glb_url.clone()
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to read GLB bytes, using Tripo URL");
+                                    status.glb_url.clone()
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::warn!("Failed to download GLB from Tripo, using raw URL");
+                            status.glb_url.clone()
+                        }
+                    }
+                } else {
+                    status.glb_url.clone()
+                };
+
                 let _ = event_tx
                     .send(serde_json::json!({
                         "type": "completed",
                         "taskId": task_id,
-                        "glbUrl": status.glb_url,
+                        "glbUrl": final_glb_url,
                         "polyCount": status.poly_count,
                     }))
                     .await;

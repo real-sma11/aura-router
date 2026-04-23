@@ -104,7 +104,8 @@ impl S3Config {
         content_type: &str,
         extension: &str,
     ) -> Result<String, String> {
-        let key = Self::generate_key(user_id, "image", extension);
+        let asset_type = if extension == "glb" || content_type.contains("gltf") { "model" } else { "image" };
+        let key = Self::generate_key(user_id, asset_type, extension);
 
         self.client
             .put_object()
