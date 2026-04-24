@@ -287,7 +287,7 @@ mod tests {
         assert_eq!(
             cache_aware_cost_cents(
                 "fireworks",
-                "aura-deepseek-v3-2",
+                "aura-kimi-k2-5",
                 1_000_000,
                 500_000,
                 0,

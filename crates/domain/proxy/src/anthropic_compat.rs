@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn rejects_fireworks_requests_with_store_flag() {
         let request = json!({
-            "model": "aura-deepseek-v3-2",
+            "model": "aura-kimi-k2-5",
             "store": true,
             "messages": [{
                 "role": "user",
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn rejects_fireworks_requests_with_response_state_replay() {
         let request = json!({
-            "model": "aura-deepseek-v3-2",
+            "model": "aura-kimi-k2-5",
             "response_id": "resp_123",
             "messages": [{
                 "role": "user",

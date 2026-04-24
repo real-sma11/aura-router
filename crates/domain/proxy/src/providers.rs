@@ -82,11 +82,6 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "o4-mini",
             provider: Provider::OpenAi,
         }),
-        "aura-deepseek-v3-2" => Some(ResolvedModel {
-            requested_model: model,
-            upstream_model: "accounts/fireworks/models/deepseek-v3p2",
-            provider: Provider::Fireworks,
-        }),
         "aura-deepseek-v4-pro" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "deepseek-v4-pro",
@@ -204,7 +199,6 @@ pub fn max_context_tokens(model: &str) -> u64 {
         m if m.starts_with("o4") => 200_000,
         m if m.starts_with("codex") => 200_000,
         // Fireworks OSS
-        "accounts/fireworks/models/deepseek-v3p2" => 163_840,
         "accounts/fireworks/models/kimi-k2p5" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,

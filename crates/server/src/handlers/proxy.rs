@@ -1076,7 +1076,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "model": "aura-deepseek-v3-2",
+                    "model": "aura-kimi-k2-5",
                     "max_tokens": 32,
                     "temperature": 0,
                     "messages": [
@@ -1103,7 +1103,7 @@ mod tests {
             .expect("response bytes");
         let response: serde_json::Value =
             serde_json::from_slice(&bytes).expect("normalized anthropic response");
-        assert_eq!(response["model"], "aura-deepseek-v3-2");
+        assert_eq!(response["model"], "aura-kimi-k2-5");
         let text = response["content"]
             .as_array()
             .and_then(|blocks| {
