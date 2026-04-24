@@ -32,6 +32,72 @@ pub struct LlmMetric {
     pub output_tokens: u64,
 }
 
+const DEFAULT_LLM_MARKUP_MULTIPLIER: f64 = 1.20;
+
+#[derive(Debug, Clone, Copy)]
+struct DeepSeekRates {
+    cache_hit_input_cents_per_million: f64,
+    cache_miss_input_cents_per_million: f64,
+    output_cents_per_million: f64,
+}
+
+/// Calculate a cache-aware cost override for providers whose raw usage has
+/// more detail than z-billing's generic input/output metric.
+pub fn cache_aware_cost_cents(
+    provider: &str,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+) -> Option<i64> {
+    if provider != "deepseek" {
+        return None;
+    }
+
+    let rates = deepseek_rates(model)?;
+    if cache_creation_input_tokens == 0 && cache_read_input_tokens == 0 {
+        return None;
+    }
+
+    let categorized_input = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
+    let uncategorized_input = input_tokens.saturating_sub(categorized_input);
+    let cache_miss_input_tokens = cache_creation_input_tokens.saturating_add(uncategorized_input);
+
+    let total_cents = ((cache_miss_input_tokens as f64 * rates.cache_miss_input_cents_per_million)
+        + (cache_read_input_tokens as f64 * rates.cache_hit_input_cents_per_million)
+        + (output_tokens as f64 * rates.output_cents_per_million))
+        * DEFAULT_LLM_MARKUP_MULTIPLIER
+        / 1_000_000.0;
+
+    let rounded = total_cents.round() as i64;
+    if rounded == 0 && (input_tokens > 0 || output_tokens > 0) {
+        Some(1)
+    } else {
+        Some(rounded)
+    }
+}
+
+fn deepseek_rates(model: &str) -> Option<DeepSeekRates> {
+    let model = model.strip_prefix("deepseek/").unwrap_or(model);
+
+    match model {
+        "aura-deepseek-v4-pro" | "deepseek-v4-pro" => Some(DeepSeekRates {
+            cache_hit_input_cents_per_million: 14.5,
+            cache_miss_input_cents_per_million: 174.0,
+            output_cents_per_million: 348.0,
+        }),
+        "aura-deepseek-v4-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
+            Some(DeepSeekRates {
+                cache_hit_input_cents_per_million: 2.8,
+                cache_miss_input_cents_per_million: 14.0,
+                output_cents_per_million: 28.0,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Pre-check whether a user has sufficient credits.
 pub async fn check_credits(
     client: &reqwest::Client,
@@ -134,24 +200,29 @@ pub async fn report_usage(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cost_cents: Option<i64>,
 ) -> Result<UsageResponse, AppError> {
     let url = format!("{billing_url}/v1/usage");
+    let mut body = serde_json::json!({
+        "event_id": event_id,
+        "user_id": user_id,
+        "metric": {
+            "type": "llm_tokens",
+            "provider": provider,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+    if let Some(cost_cents) = cost_cents {
+        body["cost_cents"] = serde_json::Value::from(cost_cents);
+    }
 
     let resp = client
         .post(&url)
         .header("x-api-key", api_key)
         .header("x-service-name", "aura-router")
-        .json(&serde_json::json!({
-            "event_id": event_id,
-            "user_id": user_id,
-            "metric": {
-                "type": "llm_tokens",
-                "provider": provider,
-                "model": model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens
-            }
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| AppError::BillingError(format!("z-billing unreachable: {e}")))?;
@@ -168,4 +239,61 @@ pub async fn report_usage(
     resp.json::<UsageResponse>()
         .await
         .map_err(|e| AppError::BillingError(format!("z-billing response parse error: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_aware_cost_cents;
+
+    #[test]
+    fn deepseek_cache_aware_cost_uses_cache_buckets_and_markup() {
+        assert_eq!(
+            cache_aware_cost_cents(
+                "deepseek",
+                "aura-deepseek-v4-pro",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000,
+            ),
+            Some(226)
+        );
+        assert_eq!(
+            cache_aware_cost_cents(
+                "deepseek",
+                "deepseek/deepseek-v4-flash",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000,
+            ),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn deepseek_cost_override_is_absent_without_cache_buckets() {
+        assert_eq!(
+            cache_aware_cost_cents(
+                "deepseek",
+                "aura-deepseek-v4-flash",
+                1_000_000,
+                500_000,
+                0,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            cache_aware_cost_cents(
+                "fireworks",
+                "aura-deepseek-v3-2",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000,
+            ),
+            None
+        );
+    }
 }

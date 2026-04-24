@@ -8,6 +8,7 @@ pub enum Provider {
     Anthropic,
     OpenAi,
     Fireworks,
+    DeepSeek,
 }
 
 impl Provider {
@@ -17,6 +18,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::OpenAi => "openai",
             Provider::Fireworks => "fireworks",
+            Provider::DeepSeek => "deepseek",
         }
     }
 }
@@ -85,6 +87,26 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/deepseek-v3p2",
             provider: Provider::Fireworks,
         }),
+        "aura-deepseek-v4-pro" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "deepseek-v4-pro",
+            provider: Provider::DeepSeek,
+        }),
+        "aura-deepseek-v4-flash" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "deepseek-v4-flash",
+            provider: Provider::DeepSeek,
+        }),
+        "deepseek/deepseek-v4-pro" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "deepseek-v4-pro",
+            provider: Provider::DeepSeek,
+        }),
+        "deepseek/deepseek-v4-flash" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "deepseek-v4-flash",
+            provider: Provider::DeepSeek,
+        }),
         "aura-kimi-k2-5" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "accounts/fireworks/models/kimi-k2p5",
@@ -105,7 +127,9 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
 }
 
 fn infer_provider(model: &str) -> Option<Provider> {
-    if model.starts_with("claude") {
+    if model == "gpt-5.5" {
+        None
+    } else if model.starts_with("claude") {
         Some(Provider::Anthropic)
     } else if model.starts_with("gpt")
         || model.starts_with("o1")
@@ -114,6 +138,11 @@ fn infer_provider(model: &str) -> Option<Provider> {
         || model.starts_with("codex")
     {
         Some(Provider::OpenAi)
+    } else if model.starts_with("deepseek-v4")
+        || model == "deepseek-chat"
+        || model == "deepseek-reasoner"
+    {
+        Some(Provider::DeepSeek)
     } else {
         None
     }
@@ -145,6 +174,7 @@ pub fn provider_url(provider: &Provider) -> &'static str {
         // Intentionally use the stateless chat completions path for Aura's OSS lane.
         // Aura Router centrally avoids Fireworks surfaces that can retain conversation state.
         Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
+        Provider::DeepSeek => "https://api.deepseek.com/chat/completions",
     }
 }
 
@@ -178,6 +208,10 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "accounts/fireworks/models/kimi-k2p5" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
+        // DeepSeek V4 direct API
+        "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
+            1_000_000
+        }
         _ => 200_000, // safe default
     }
 }
@@ -196,7 +230,7 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
                 HeaderValue::from_static("prompt-caching-2024-07-31"),
             );
         }
-        Provider::OpenAi => {
+        Provider::OpenAi | Provider::DeepSeek => {
             headers.insert(
                 "authorization",
                 HeaderValue::from_str(&format!("Bearer {api_key}")).ok()?,
@@ -240,5 +274,31 @@ mod tests {
             resolve_provider("aura-kimi-k2-5"),
             Some(Provider::Fireworks)
         );
+        assert_eq!(
+            resolve_provider("aura-deepseek-v4-flash"),
+            Some(Provider::DeepSeek)
+        );
+    }
+
+    #[test]
+    fn resolves_deepseek_v4_models_to_direct_api() {
+        let resolved = resolve_model("aura-deepseek-v4-pro").expect("aura alias");
+        assert_eq!(resolved.upstream_model, "deepseek-v4-pro");
+        assert_eq!(resolved.provider, Provider::DeepSeek);
+
+        let resolved = resolve_model("deepseek/deepseek-v4-flash").expect("provider alias");
+        assert_eq!(resolved.upstream_model, "deepseek-v4-flash");
+        assert_eq!(resolved.provider, Provider::DeepSeek);
+
+        let resolved = resolve_model("deepseek-chat").expect("compat alias");
+        assert_eq!(resolved.upstream_model, "deepseek-chat");
+        assert_eq!(resolved.provider, Provider::DeepSeek);
+    }
+
+    #[test]
+    fn does_not_resolve_undocumented_gpt_5_5() {
+        assert_eq!(resolve_model("aura-gpt-5-5"), None);
+        assert_eq!(resolve_model("gpt-5.5"), None);
+        assert_eq!(resolve_provider("gpt-5.5"), None);
     }
 }

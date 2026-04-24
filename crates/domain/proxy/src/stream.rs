@@ -140,7 +140,7 @@ impl StreamAdapter {
             Provider::Anthropic => Self::Anthropic(AnthropicPassthrough {
                 parser: SseParser::new(),
             }),
-            Provider::OpenAi | Provider::Fireworks => {
+            Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
                 Self::OpenAi(OpenAiCompatStream::new(requested_model))
             }
         }
@@ -293,6 +293,26 @@ impl OpenAiCompatStream {
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(self.usage.output_tokens);
+            self.usage.cache_creation_input_tokens = usage
+                .get("prompt_cache_miss_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(self.usage.cache_creation_input_tokens);
+            self.usage.cache_read_input_tokens = usage
+                .get("prompt_cache_hit_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    usage
+                        .get("prompt_tokens_details")
+                        .and_then(|details| details.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                })
+                .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+                .unwrap_or(self.usage.cache_read_input_tokens);
             if self.pending_stop_reason.is_some() {
                 self.finish_message(output);
             }
@@ -398,7 +418,10 @@ impl OpenAiCompatStream {
             }
         }
 
-        if let Some(arguments) = tool_call.pointer("/function/arguments").and_then(Value::as_str) {
+        if let Some(arguments) = tool_call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+        {
             if state.started {
                 output.push_back(anthropic_sse(
                     "content_block_delta",
@@ -726,11 +749,21 @@ mod tests {
         let usage = rx.await.unwrap();
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 5);
-        assert!(emitted.iter().any(|chunk| chunk.contains("event: message_start")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"text\":\"Hello\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"text\":\" world\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"stop_reason\":\"end_turn\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("event: message_stop")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("event: message_start")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"text\":\"Hello\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"text\":\" world\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"stop_reason\":\"end_turn\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("event: message_stop")));
     }
 
     #[tokio::test]
@@ -757,9 +790,44 @@ mod tests {
 
         let usage = rx.await.unwrap();
         assert_eq!(usage.output_tokens, 4);
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"type\":\"tool_use\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"partial_json\":\"{\\\"q\\\":\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"partial_json\":\"\\\"aura\\\"}\"")));
-        assert!(emitted.iter().any(|chunk| chunk.contains("\"stop_reason\":\"tool_use\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"type\":\"tool_use\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"partial_json\":\"{\\\"q\\\":\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"partial_json\":\"\\\"aura\\\"}\"")));
+        assert!(emitted
+            .iter()
+            .any(|chunk| chunk.contains("\"stop_reason\":\"tool_use\"")));
+    }
+
+    #[tokio::test]
+    async fn deepseek_stream_captures_cache_usage_aliases() {
+        let stream = bytes_stream(vec![
+            "data: {\"id\":\"deepseek-123\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"deepseek-123\",\"model\":\"deepseek-v4-flash\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":8,\"prompt_cache_miss_tokens\":30,\"prompt_cache_hit_tokens\":70}}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        let (tx, rx) = oneshot::channel();
+        let mut tee = TeeStream {
+            inner: Box::pin(stream),
+            adapter: StreamAdapter::new(Provider::DeepSeek, "aura-deepseek-v4-flash"),
+            usage_tx: Some(tx),
+            finished: false,
+            pending_output: VecDeque::new(),
+        };
+
+        while let Some(chunk) = tee.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        let usage = rx.await.unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.cache_read_input_tokens, 70);
     }
 }

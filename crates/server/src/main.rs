@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         fireworks_api_key: std::env::var("FIREWORKS_API_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
+        deepseek_api_key: std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
         google_api_key: std::env::var("GOOGLE_API_KEY")
             .ok()
             .filter(|s| !s.is_empty()),

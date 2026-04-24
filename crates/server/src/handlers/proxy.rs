@@ -110,6 +110,10 @@ pub async fn messages(
             .fireworks_api_key
             .clone()
             .ok_or_else(|| AppError::BadRequest("Fireworks provider not configured".into()))?,
+        providers::Provider::DeepSeek => state
+            .deepseek_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("DeepSeek provider not configured".into()))?,
     };
 
     // Forward to provider
@@ -207,6 +211,14 @@ async fn handle_non_streaming(
         .pointer("/usage/output_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let cache_creation_input_tokens = response_value
+        .pointer("/usage/cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read_input_tokens = response_value
+        .pointer("/usage/cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let org_id_ref = session_ctx.as_ref().map(|c| c.org_id.as_deref()).flatten();
     let project_id_ref = session_ctx.as_ref().map(|c| c.project_id.as_str());
@@ -222,6 +234,8 @@ async fn handle_non_streaming(
         model,
         input_tokens,
         output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
         duration_ms,
     );
 
@@ -313,6 +327,8 @@ async fn handle_streaming(
                 model,
                 usage.input_tokens,
                 usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
                 duration_ms,
             );
 
@@ -366,6 +382,7 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
     match provider_name {
         "openai" => providers::Provider::OpenAi,
         "fireworks" => providers::Provider::Fireworks,
+        "deepseek" => providers::Provider::DeepSeek,
         _ => providers::Provider::Anthropic,
     }
 }
@@ -440,6 +457,8 @@ fn spawn_post_request_tasks(
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     duration_ms: u64,
 ) {
     let event_id = uuid::Uuid::new_v4().to_string();
@@ -448,6 +467,14 @@ fn spawn_post_request_tasks(
     let provider_owned = provider_name.to_string();
     let org_id_owned = org_id.map(String::from);
     let project_id_owned = project_id.map(String::from);
+    let cost_cents = billing::cache_aware_cost_cents(
+        provider_name,
+        model,
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    );
 
     // Debit z-billing
     {
@@ -468,6 +495,7 @@ fn spawn_post_request_tasks(
                 &model,
                 input_tokens,
                 output_tokens,
+                cost_cents,
             )
             .await
             {
@@ -568,6 +596,7 @@ mod tests {
     ) {
         let recorded_requests = Arc::new(Mutex::new(Vec::new()));
         let recorded_for_check = Arc::clone(&recorded_requests);
+        let recorded_for_usage = Arc::clone(&recorded_requests);
         let check_response_for_route = check_response.clone();
 
         let app = Router::new()
@@ -584,13 +613,21 @@ mod tests {
             )
             .route(
                 "/v1/usage",
-                post(|| async {
-                    Json(json!({
-                        "success": true,
-                        "balance_cents": 999_999,
-                        "cost_cents": 1,
-                        "transaction_id": "txn_test",
-                    }))
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorded_for_usage = Arc::clone(&recorded_for_usage);
+                    async move {
+                        let cost_cents = body
+                            .get("cost_cents")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(1);
+                        recorded_for_usage.lock().unwrap().push(body);
+                        Json(json!({
+                            "success": true,
+                            "balance_cents": 999_999,
+                            "cost_cents": cost_cents,
+                            "transaction_id": "txn_test",
+                        }))
+                    }
                 }),
             );
 
@@ -637,6 +674,7 @@ mod tests {
             anthropic_api_key,
             openai_api_key,
             fireworks_api_key,
+            deepseek_api_key: None,
             google_api_key: None,
             tripo_api_key: None,
             z_billing_url: billing_url,
@@ -725,6 +763,95 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("required=3"));
+    }
+
+    #[tokio::test]
+    async fn uses_deepseek_provider_for_model_aware_credit_check() {
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-deepseek-credit-check");
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": false,
+            "balance_cents": 1,
+            "required_cents": 3,
+        }))
+        .await;
+
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            "unused".to_string(),
+            None,
+            None,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-deepseek-v4-flash",
+                    "max_tokens": 32,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "hello"}]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["provider"], "deepseek");
+        assert_eq!(requests[0]["model"], "aura-deepseek-v4-flash");
+    }
+
+    #[tokio::test]
+    async fn reports_deepseek_cache_aware_usage_cost_to_billing() {
+        let cookie_secret = "test-cookie-secret";
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": true,
+            "balance_cents": 1_000_000,
+            "required_cents": 1,
+        }))
+        .await;
+        let state = test_state(cookie_secret, billing_url, "unused".to_string(), None, None);
+
+        super::spawn_post_request_tasks(
+            &state,
+            "user-deepseek-billing",
+            None,
+            None,
+            "deepseek",
+            "aura-deepseek-v4-flash",
+            1_000_000,
+            500_000,
+            0,
+            1_000_000,
+            123,
+        );
+
+        for _ in 0..20 {
+            if !recorded_requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["user_id"], "user-deepseek-billing");
+        assert_eq!(requests[0]["cost_cents"], 20);
+        assert_eq!(requests[0]["metric"]["provider"], "deepseek");
+        assert_eq!(requests[0]["metric"]["model"], "aura-deepseek-v4-flash");
+        assert_eq!(requests[0]["metric"]["input_tokens"], 1_000_000);
+        assert_eq!(requests[0]["metric"]["output_tokens"], 500_000);
     }
 
     #[tokio::test]

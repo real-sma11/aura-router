@@ -5,7 +5,7 @@ use crate::providers::Provider;
 pub fn validate_request(provider: Provider, request: &Value) -> Result<(), String> {
     match provider {
         Provider::Anthropic => Ok(()),
-        Provider::OpenAi => validate_openai_request(request),
+        Provider::OpenAi | Provider::DeepSeek => validate_openai_request(request),
         Provider::Fireworks => {
             validate_openai_request(request)?;
             validate_fireworks_privacy_policy(request)
@@ -24,7 +24,7 @@ pub fn request_to_upstream(
             next["model"] = Value::String(upstream_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi | Provider::Fireworks => {
+        Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
             validate_openai_request(request)?;
             anthropic_request_to_openai(request, upstream_model)
         }
@@ -42,7 +42,7 @@ pub fn response_from_upstream(
             next["model"] = Value::String(requested_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi | Provider::Fireworks => {
+        Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
             openai_response_to_anthropic(response, requested_model)
         }
     }
@@ -502,8 +502,24 @@ fn openai_response_to_anthropic(response: &Value, requested_model: &str) -> Resu
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let cache_read_input_tokens = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
+        .get("prompt_cache_hit_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+        });
+    let cache_creation_input_tokens = usage
+        .get("prompt_cache_miss_tokens")
         .and_then(Value::as_u64);
+
+    let cache_read_input_tokens = cache_read_input_tokens
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+    let cache_creation_input_tokens = cache_creation_input_tokens.or_else(|| {
+        usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+    });
 
     Ok(json!({
         "id": response.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -513,7 +529,7 @@ fn openai_response_to_anthropic(response: &Value, requested_model: &str) -> Resu
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": Value::Null,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
         }
     }))
@@ -760,6 +776,37 @@ mod tests {
         assert_eq!(translated["content"][1]["type"], "tool_use");
         assert_eq!(translated["usage"]["input_tokens"], 12);
         assert_eq!(translated["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn translates_deepseek_cache_usage_aliases() {
+        let response = json!({
+            "id": "deepseek_123",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Done"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_cache_miss_tokens": 30,
+                "prompt_cache_hit_tokens": 70
+            }
+        });
+
+        let translated =
+            response_from_upstream(Provider::DeepSeek, "aura-deepseek-v4-flash", &response)
+                .expect("translation");
+
+        assert_eq!(translated["model"], "aura-deepseek-v4-flash");
+        assert_eq!(translated["usage"]["input_tokens"], 100);
+        assert_eq!(translated["usage"]["output_tokens"], 20);
+        assert_eq!(translated["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 70);
     }
 
     #[test]
