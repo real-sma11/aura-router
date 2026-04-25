@@ -763,7 +763,10 @@ mod tests {
             }],
             "usage": {
                 "prompt_tokens": 12,
-                "completion_tokens": 7
+                "completion_tokens": 7,
+                "prompt_tokens_details": {
+                    "cached_tokens": 8
+                }
             }
         });
 
@@ -776,6 +779,7 @@ mod tests {
         assert_eq!(translated["content"][1]["type"], "tool_use");
         assert_eq!(translated["usage"]["input_tokens"], 12);
         assert_eq!(translated["usage"]["output_tokens"], 7);
+        assert_eq!(translated["usage"]["cache_read_input_tokens"], 8);
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub struct LlmMetric {
 const DEFAULT_LLM_MARKUP_MULTIPLIER: f64 = 1.20;
 
 #[derive(Debug, Clone, Copy)]
-struct DeepSeekRates {
+struct CacheAwareRates {
     cache_hit_input_cents_per_million: f64,
     cache_miss_input_cents_per_million: f64,
     output_cents_per_million: f64,
@@ -51,14 +51,10 @@ pub fn cache_aware_cost_cents(
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
 ) -> Option<i64> {
-    if provider != "deepseek" {
-        return None;
-    }
-
-    let rates = deepseek_rates(model)?;
     if cache_creation_input_tokens == 0 && cache_read_input_tokens == 0 {
         return None;
     }
+    let rates = cache_aware_rates(provider, model)?;
 
     let categorized_input = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
     let uncategorized_input = input_tokens.saturating_sub(categorized_input);
@@ -78,22 +74,58 @@ pub fn cache_aware_cost_cents(
     }
 }
 
-fn deepseek_rates(model: &str) -> Option<DeepSeekRates> {
+fn cache_aware_rates(provider: &str, model: &str) -> Option<CacheAwareRates> {
+    match provider {
+        "deepseek" => deepseek_rates(model),
+        "openai" => openai_rates(model),
+        _ => None,
+    }
+}
+
+fn deepseek_rates(model: &str) -> Option<CacheAwareRates> {
     let model = model.strip_prefix("deepseek/").unwrap_or(model);
 
     match model {
-        "aura-deepseek-v4-pro" | "deepseek-v4-pro" => Some(DeepSeekRates {
+        "aura-deepseek-v4-pro" | "deepseek-v4-pro" => Some(CacheAwareRates {
             cache_hit_input_cents_per_million: 14.5,
             cache_miss_input_cents_per_million: 174.0,
             output_cents_per_million: 348.0,
         }),
         "aura-deepseek-v4-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
-            Some(DeepSeekRates {
+            Some(CacheAwareRates {
                 cache_hit_input_cents_per_million: 2.8,
                 cache_miss_input_cents_per_million: 14.0,
                 output_cents_per_million: 28.0,
             })
         }
+        _ => None,
+    }
+}
+
+fn openai_rates(model: &str) -> Option<CacheAwareRates> {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+
+    match model {
+        "aura-gpt-5-5" | "gpt-5.5" => Some(CacheAwareRates {
+            cache_hit_input_cents_per_million: 50.0,
+            cache_miss_input_cents_per_million: 500.0,
+            output_cents_per_million: 3000.0,
+        }),
+        "aura-gpt-5-4" | "gpt-5.4" => Some(CacheAwareRates {
+            cache_hit_input_cents_per_million: 25.0,
+            cache_miss_input_cents_per_million: 250.0,
+            output_cents_per_million: 1500.0,
+        }),
+        "aura-gpt-5-4-mini" | "gpt-5.4-mini" => Some(CacheAwareRates {
+            cache_hit_input_cents_per_million: 7.5,
+            cache_miss_input_cents_per_million: 75.0,
+            output_cents_per_million: 450.0,
+        }),
+        "aura-gpt-5-4-nano" | "gpt-5.4-nano" => Some(CacheAwareRates {
+            cache_hit_input_cents_per_million: 2.0,
+            cache_miss_input_cents_per_million: 20.0,
+            output_cents_per_million: 125.0,
+        }),
         _ => None,
     }
 }
@@ -293,6 +325,30 @@ mod tests {
                 0,
                 1_000_000,
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_cache_aware_cost_discounts_cached_tokens() {
+        assert_eq!(
+            cache_aware_cost_cents("openai", "aura-gpt-5-5", 1_000_000, 500_000, 0, 1_000_000,),
+            Some(1860)
+        );
+        assert_eq!(
+            cache_aware_cost_cents("openai", "gpt-5.4-mini", 1_000_000, 500_000, 0, 1_000_000,),
+            Some(279)
+        );
+    }
+
+    #[test]
+    fn openai_cost_override_is_absent_without_cached_tokens_or_rates() {
+        assert_eq!(
+            cache_aware_cost_cents("openai", "aura-gpt-5-5", 1_000_000, 500_000, 0, 0),
+            None
+        );
+        assert_eq!(
+            cache_aware_cost_cents("openai", "gpt-4.1", 1_000_000, 500_000, 0, 1_000_000),
             None
         );
     }

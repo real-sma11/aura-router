@@ -120,12 +120,19 @@ pub async fn messages(
     let upstream_url = providers::provider_url(&resolved_model.provider);
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
-    let upstream_request_value = anthropic_compat::request_to_upstream(
+    let mut upstream_request_value = anthropic_compat::request_to_upstream(
         provider,
         resolved_model.upstream_model,
         &request_value,
     )
     .map_err(AppError::BadRequest)?;
+    apply_provider_request_controls(
+        provider,
+        &mut upstream_request_value,
+        &auth.user_id,
+        resolved_model.upstream_model,
+        session_ctx.as_ref(),
+    );
     let upstream_body = serde_json::to_vec(&upstream_request_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
@@ -384,6 +391,75 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
         "fireworks" => providers::Provider::Fireworks,
         "deepseek" => providers::Provider::DeepSeek,
         _ => providers::Provider::Anthropic,
+    }
+}
+
+fn apply_provider_request_controls(
+    provider: providers::Provider,
+    upstream_body: &mut serde_json::Value,
+    user_id: &str,
+    upstream_model: &str,
+    session_ctx: Option<&storage::SessionContext>,
+) {
+    if provider != providers::Provider::OpenAi {
+        return;
+    }
+
+    let Some(body) = upstream_body.as_object_mut() else {
+        return;
+    };
+    body.entry("prompt_cache_key").or_insert_with(|| {
+        serde_json::Value::String(openai_prompt_cache_key(
+            user_id,
+            upstream_model,
+            session_ctx,
+        ))
+    });
+}
+
+fn openai_prompt_cache_key(
+    user_id: &str,
+    upstream_model: &str,
+    session_ctx: Option<&storage::SessionContext>,
+) -> String {
+    let model = sanitize_cache_key_component(upstream_model);
+    match session_ctx {
+        Some(ctx) => {
+            let principal = ctx
+                .org_id
+                .as_deref()
+                .map(|org_id| format!("org:{}", sanitize_cache_key_component(org_id)))
+                .unwrap_or_else(|| format!("user:{}", sanitize_cache_key_component(user_id)));
+            format!(
+                "aura:v1:{principal}:project:{}:agent:{}:model:{model}",
+                sanitize_cache_key_component(&ctx.project_id),
+                sanitize_cache_key_component(&ctx.project_agent_id),
+            )
+        }
+        None => format!(
+            "aura:v1:user:{}:model:{model}",
+            sanitize_cache_key_component(user_id)
+        ),
+    }
+}
+
+fn sanitize_cache_key_component(value: &str) -> String {
+    let sanitized: String = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -688,6 +764,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn openai_prompt_cache_key_uses_stable_project_agent_scope() {
+        let session = aura_router_proxy::storage::SessionContext {
+            session_id: "session-ignored".to_string(),
+            project_agent_id: "agent:123".to_string(),
+            project_id: "project 456".to_string(),
+            org_id: Some("org-789".to_string()),
+        };
+
+        let key = super::openai_prompt_cache_key("user-1", "gpt-5.5", Some(&session));
+
+        assert_eq!(
+            key,
+            "aura:v1:org:org-789:project:project_456:agent:agent_123:model:gpt-5.5"
+        );
+        assert!(!key.contains("session-ignored"));
+    }
+
+    #[test]
+    fn openai_prompt_cache_key_falls_back_to_user_scope() {
+        let key = super::openai_prompt_cache_key("user@example.com", "gpt-5.5", None);
+
+        assert_eq!(key, "aura:v1:user:user@example.com:model:gpt-5.5");
+    }
+
+    #[test]
+    fn openai_provider_request_controls_add_prompt_cache_key() {
+        let session = aura_router_proxy::storage::SessionContext {
+            session_id: "session-ignored".to_string(),
+            project_agent_id: "agent-a".to_string(),
+            project_id: "project-a".to_string(),
+            org_id: Some("org-a".to_string()),
+        };
+        let mut upstream = json!({
+            "model": "gpt-5.5",
+            "messages": []
+        });
+
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::OpenAi,
+            &mut upstream,
+            "user-a",
+            "gpt-5.5",
+            Some(&session),
+        );
+
+        assert_eq!(
+            upstream["prompt_cache_key"],
+            "aura:v1:org:org-a:project:project-a:agent:agent-a:model:gpt-5.5"
+        );
+        assert!(upstream.get("prompt_cache_retention").is_none());
+    }
+
     #[tokio::test]
     async fn normalizes_upstream_json_errors_to_anthropic_shape() {
         let response = super::normalize_upstream_error(
@@ -850,6 +979,48 @@ mod tests {
         assert_eq!(requests[0]["cost_cents"], 20);
         assert_eq!(requests[0]["metric"]["provider"], "deepseek");
         assert_eq!(requests[0]["metric"]["model"], "aura-deepseek-v4-flash");
+        assert_eq!(requests[0]["metric"]["input_tokens"], 1_000_000);
+        assert_eq!(requests[0]["metric"]["output_tokens"], 500_000);
+    }
+
+    #[tokio::test]
+    async fn reports_openai_cache_aware_usage_cost_to_billing() {
+        let cookie_secret = "test-cookie-secret";
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": true,
+            "balance_cents": 1_000_000,
+            "required_cents": 1,
+        }))
+        .await;
+        let state = test_state(cookie_secret, billing_url, "unused".to_string(), None, None);
+
+        super::spawn_post_request_tasks(
+            &state,
+            "user-openai-billing",
+            Some("org-openai"),
+            Some("project-openai"),
+            "openai",
+            "aura-gpt-5-5",
+            1_000_000,
+            500_000,
+            0,
+            1_000_000,
+            123,
+        );
+
+        for _ in 0..20 {
+            if !recorded_requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["user_id"], "user-openai-billing");
+        assert_eq!(requests[0]["cost_cents"], 1860);
+        assert_eq!(requests[0]["metric"]["provider"], "openai");
+        assert_eq!(requests[0]["metric"]["model"], "aura-gpt-5-5");
         assert_eq!(requests[0]["metric"]["input_tokens"], 1_000_000);
         assert_eq!(requests[0]["metric"]["output_tokens"], 500_000);
     }
