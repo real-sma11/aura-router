@@ -732,7 +732,7 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
-                    "model": "aura-gpt-5-4",
+                    "model": "aura-gpt-5-5",
                     "max_tokens": 32,
                     "messages": [
                         {
@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["required_cents"], 0);
         assert_eq!(requests[0]["provider"], "openai");
-        assert_eq!(requests[0]["model"], "aura-gpt-5-4");
+        assert_eq!(requests[0]["model"], "aura-gpt-5-5");
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

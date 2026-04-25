@@ -52,6 +52,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "claude-haiku-4-5",
             provider: Provider::Anthropic,
         }),
+        "aura-gpt-5-5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gpt-5.5",
+            provider: Provider::OpenAi,
+        }),
         "aura-gpt-5-4" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "gpt-5.4",
@@ -122,9 +127,7 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
 }
 
 fn infer_provider(model: &str) -> Option<Provider> {
-    if model == "gpt-5.5" {
-        None
-    } else if model.starts_with("claude") {
+    if model.starts_with("claude") {
         Some(Provider::Anthropic)
     } else if model.starts_with("gpt")
         || model.starts_with("o1")
@@ -187,6 +190,7 @@ pub fn max_context_tokens(model: &str) -> u64 {
         m if m.starts_with("claude-3") => 200_000,
         m if m.starts_with("claude") => 200_000,
         // OpenAI
+        "gpt-5.5" => 1_000_000,
         "gpt-5.4" => 1_050_000,
         "gpt-5.4-mini" => 400_000,
         "gpt-5.4-nano" => 400_000,
@@ -247,6 +251,11 @@ mod tests {
 
     #[test]
     fn resolves_aura_aliases_to_upstream_models() {
+        let resolved = resolve_model("aura-gpt-5-5").expect("model alias should resolve");
+        assert_eq!(resolved.requested_model, "aura-gpt-5-5");
+        assert_eq!(resolved.upstream_model, "gpt-5.5");
+        assert_eq!(resolved.provider, Provider::OpenAi);
+
         let resolved = resolve_model("aura-gpt-5-4-mini").expect("model alias should resolve");
         assert_eq!(resolved.requested_model, "aura-gpt-5-4-mini");
         assert_eq!(resolved.upstream_model, "gpt-5.4-mini");
@@ -263,6 +272,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_understands_aura_aliases() {
+        assert_eq!(resolve_provider("aura-gpt-5-5"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-gpt-5-4"), Some(Provider::OpenAi));
         assert_eq!(
             resolve_provider("aura-kimi-k2-5"),
@@ -290,9 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_resolve_undocumented_gpt_5_5() {
-        assert_eq!(resolve_model("aura-gpt-5-5"), None);
-        assert_eq!(resolve_model("gpt-5.5"), None);
-        assert_eq!(resolve_provider("gpt-5.5"), None);
+    fn resolves_gpt_5_5_api_model() {
+        let resolved = resolve_model("gpt-5.5").expect("api model should resolve");
+        assert_eq!(resolved.requested_model, "gpt-5.5");
+        assert_eq!(resolved.upstream_model, "gpt-5.5");
+        assert_eq!(resolved.provider, Provider::OpenAi);
     }
 }
