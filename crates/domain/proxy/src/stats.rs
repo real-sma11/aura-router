@@ -5,6 +5,15 @@
 /// Calls POST /internal/usage with X-Internal-Token. Any of `org_id`,
 /// `project_id`, `agent_id` may be `None`; the receiver stores `null`
 /// and aggregations scoped by those columns simply exclude the row.
+///
+/// IMPORTANT: `agent_id` is currently swallowed and NOT sent to
+/// aura-network — passing it would trigger
+/// `token_usage_daily_agent_id_fkey` FK violations. The header
+/// `x-aura-agent-id` carries aura-code's `project_agents.id`, but
+/// aura-network's FK references its own `agents` table — different
+/// tables in different services. Until proper id translation lands,
+/// we keep the legacy behaviour of sending `agentId: null` so the
+/// row inserts cleanly. Per-agent attribution is a follow-up.
 /// Errors are logged but do not block the response.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_usage(
@@ -14,7 +23,7 @@ pub async fn record_usage(
     user_id: &str,
     org_id: Option<&str>,
     project_id: Option<&str>,
-    agent_id: Option<&str>,
+    _agent_id: Option<&str>,
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
@@ -30,7 +39,7 @@ pub async fn record_usage(
             "orgId": org_id,
             "userId": user_id,
             "zeroUserId": user_id,
-            "agentId": agent_id,
+            "agentId": serde_json::Value::Null,
             "projectId": project_id,
             "model": model,
             "inputTokens": input_tokens,
