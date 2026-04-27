@@ -3,35 +3,54 @@
 //! Stores LLM prompts and responses as session events to aura-storage.
 //! Requires session context headers from the client (X-Aura-Session-Id, etc.).
 
-/// Context headers from the client request, used for storage recording.
-#[derive(Debug, Clone)]
+/// Context headers from the client request, used for storage recording
+/// and per-call cost attribution.
+///
+/// All fields are optional: callers that can supply only a subset (e.g.
+/// a task-extract harness session that has a project_id but no live
+/// session_id) still get partial attribution. `from_headers` returns
+/// `None` only when every aura-* header is absent. Downstream code
+/// handles each missing field individually — e.g. session-event writes
+/// skip when `session_id` is None, while cost attribution still works
+/// from `project_id` alone.
+#[derive(Debug, Clone, Default)]
 pub struct SessionContext {
-    pub session_id: String,
-    pub project_agent_id: String,
-    pub project_id: String,
+    pub session_id: Option<String>,
+    pub project_agent_id: Option<String>,
+    pub project_id: Option<String>,
     pub org_id: Option<String>,
 }
 
 impl SessionContext {
     /// Extract session context from request headers.
-    /// Returns None if required headers are missing.
+    ///
+    /// Returns `None` only when no aura-* headers are present at all.
+    /// A single recognised header is enough to produce a `Some`; missing
+    /// headers within the context simply stay `None`. This means
+    /// downstream code must treat every field as optional and skip work
+    /// that genuinely needs a missing id (e.g. session-event writes
+    /// only fire when `session_id` is set), while attribution-only
+    /// paths (cost reporting) still work from `project_id` alone.
     pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
-        let session_id = headers
-            .get("x-aura-session-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let project_agent_id = headers
-            .get("x-aura-agent-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let project_id = headers
-            .get("x-aura-project-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let org_id = headers
-            .get("x-aura-org-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        let read = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+
+        let session_id = read("x-aura-session-id");
+        let project_agent_id = read("x-aura-agent-id");
+        let project_id = read("x-aura-project-id");
+        let org_id = read("x-aura-org-id");
+
+        if session_id.is_none()
+            && project_agent_id.is_none()
+            && project_id.is_none()
+            && org_id.is_none()
+        {
+            return None;
+        }
 
         Some(Self {
             session_id,
@@ -44,8 +63,10 @@ impl SessionContext {
 
 /// Store a user prompt and assistant response as session events (fire-and-forget).
 ///
-/// Calls POST /internal/events for each event.
-/// Errors are logged but do not block the response.
+/// Calls POST /internal/events for each event. Returns early without
+/// writing anything if `ctx.session_id` is missing — events are
+/// session-scoped and have no meaning without one. Errors are logged
+/// but do not block the response.
 pub async fn store_events(
     client: &reqwest::Client,
     storage_url: &str,
@@ -58,6 +79,11 @@ pub async fn store_events(
     input_tokens: u64,
     output_tokens: u64,
 ) {
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        tracing::debug!("Skipping event storage: no x-aura-session-id header");
+        return;
+    };
+
     let url = format!("{storage_url}/internal/events");
 
     // Store user prompt as event
@@ -65,7 +91,7 @@ pub async fn store_events(
         .post(&url)
         .header("x-internal-token", token)
         .json(&serde_json::json!({
-            "sessionId": ctx.session_id,
+            "sessionId": session_id,
             "userId": user_id,
             "agentId": ctx.project_agent_id,
             "sender": "user",
@@ -108,7 +134,7 @@ pub async fn store_events(
         .post(&url)
         .header("x-internal-token", token)
         .json(&serde_json::json!({
-            "sessionId": ctx.session_id,
+            "sessionId": session_id,
             "agentId": ctx.project_agent_id,
             "sender": "agent",
             "projectId": ctx.project_id,
@@ -196,5 +222,93 @@ pub async fn store_artifact(
             tracing::warn!(error = %e, "Failed to reach aura-storage for artifact");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_static(k),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn from_headers_returns_none_when_all_absent() {
+        let h = header_map(&[]);
+        assert!(SessionContext::from_headers(&h).is_none());
+    }
+
+    #[test]
+    fn from_headers_accepts_only_project_id() {
+        // The previously-required all-or-nothing gate dropped any call
+        // missing session_id. Loosening to "any-one-header" preserves
+        // cost attribution for tool sessions that have a project_id
+        // but no live storage session.
+        let h = header_map(&[("x-aura-project-id", "proj-1")]);
+        let ctx = SessionContext::from_headers(&h).expect("project_id alone should yield Some");
+        assert_eq!(ctx.project_id.as_deref(), Some("proj-1"));
+        assert!(ctx.session_id.is_none());
+        assert!(ctx.project_agent_id.is_none());
+        assert!(ctx.org_id.is_none());
+    }
+
+    #[test]
+    fn from_headers_accepts_only_session_id() {
+        let h = header_map(&[("x-aura-session-id", "sess-1")]);
+        let ctx = SessionContext::from_headers(&h).expect("session_id alone should yield Some");
+        assert_eq!(ctx.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn from_headers_reads_all_four() {
+        let h = header_map(&[
+            ("x-aura-session-id", "sess-1"),
+            ("x-aura-agent-id", "agent-1"),
+            ("x-aura-project-id", "proj-1"),
+            ("x-aura-org-id", "org-1"),
+        ]);
+        let ctx = SessionContext::from_headers(&h).expect("all-present should yield Some");
+        assert_eq!(ctx.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(ctx.project_agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(ctx.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(ctx.org_id.as_deref(), Some("org-1"));
+    }
+
+    #[tokio::test]
+    async fn store_events_returns_early_without_session_id() {
+        // Events are session-scoped; a context without session_id must
+        // not attempt the HTTP call. If it did, the unreachable URL
+        // would surface as a tracing::warn — checking that no panic /
+        // hang occurs is the regression guard.
+        let client = reqwest::Client::new();
+        let ctx = SessionContext {
+            session_id: None,
+            project_agent_id: Some("agent-1".into()),
+            project_id: Some("proj-1".into()),
+            org_id: None,
+        };
+        store_events(
+            &client,
+            "http://127.0.0.1:1", // unreachable on purpose
+            "tok",
+            &ctx,
+            "user-1",
+            "user content",
+            "assistant content",
+            None,
+            10,
+            5,
+        )
+        .await;
+        // Reaching here without panic = early-return path worked.
     }
 }

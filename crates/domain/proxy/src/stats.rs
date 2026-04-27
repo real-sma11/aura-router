@@ -2,8 +2,11 @@
 
 /// Record token usage to aura-network (fire-and-forget).
 ///
-/// Calls POST /internal/usage with X-Internal-Token.
+/// Calls POST /internal/usage with X-Internal-Token. Any of `org_id`,
+/// `project_id`, `agent_id` may be `None`; the receiver stores `null`
+/// and aggregations scoped by those columns simply exclude the row.
 /// Errors are logged but do not block the response.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_usage(
     client: &reqwest::Client,
     network_url: &str,
@@ -11,6 +14,7 @@ pub async fn record_usage(
     user_id: &str,
     org_id: Option<&str>,
     project_id: Option<&str>,
+    agent_id: Option<&str>,
     model: &str,
     input_tokens: u64,
     output_tokens: u64,
@@ -26,7 +30,7 @@ pub async fn record_usage(
             "orgId": org_id,
             "userId": user_id,
             "zeroUserId": user_id,
-            "agentId": null,
+            "agentId": agent_id,
             "projectId": project_id,
             "model": model,
             "inputTokens": input_tokens,

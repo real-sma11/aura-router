@@ -227,8 +227,9 @@ async fn handle_non_streaming(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    let org_id_ref = session_ctx.as_ref().map(|c| c.org_id.as_deref()).flatten();
-    let project_id_ref = session_ctx.as_ref().map(|c| c.project_id.as_str());
+    let org_id_ref = session_ctx.as_ref().and_then(|c| c.org_id.as_deref());
+    let project_id_ref = session_ctx.as_ref().and_then(|c| c.project_id.as_deref());
+    let agent_id_ref = session_ctx.as_ref().and_then(|c| c.project_agent_id.as_deref());
 
     let duration_ms = request_start.elapsed().as_millis() as u64;
 
@@ -237,6 +238,7 @@ async fn handle_non_streaming(
         &auth.user_id,
         org_id_ref,
         project_id_ref,
+        agent_id_ref,
         provider_name,
         model,
         input_tokens,
@@ -320,7 +322,8 @@ async fn handle_streaming(
     let billing_state = state.clone();
     let user_id = auth.user_id.clone();
     let stream_org_id = session_ctx.as_ref().and_then(|c| c.org_id.clone());
-    let stream_project_id = session_ctx.as_ref().map(|c| c.project_id.clone());
+    let stream_project_id = session_ctx.as_ref().and_then(|c| c.project_id.clone());
+    let stream_agent_id = session_ctx.as_ref().and_then(|c| c.project_agent_id.clone());
     tokio::spawn(async move {
         if let Ok(usage) = usage_rx.await {
             let duration_ms = request_start.elapsed().as_millis() as u64;
@@ -330,6 +333,7 @@ async fn handle_streaming(
                 &user_id,
                 stream_org_id.as_deref(),
                 stream_project_id.as_deref(),
+                stream_agent_id.as_deref(),
                 &provider_owned,
                 model,
                 usage.input_tokens,
@@ -430,10 +434,16 @@ fn openai_prompt_cache_key(
                 .as_deref()
                 .map(|org_id| format!("org:{}", sanitize_cache_key_component(org_id)))
                 .unwrap_or_else(|| format!("user:{}", sanitize_cache_key_component(user_id)));
+            // Cache key components fall back to "none" placeholders when
+            // headers are absent. The user_id / org_id principal still
+            // segregates per-tenant, so missing project/agent ids share
+            // a bucket within a single principal — acceptable.
             format!(
                 "aura:v1:{principal}:project:{}:agent:{}:model:{model}",
-                sanitize_cache_key_component(&ctx.project_id),
-                sanitize_cache_key_component(&ctx.project_agent_id),
+                sanitize_cache_key_component(ctx.project_id.as_deref().unwrap_or("none")),
+                sanitize_cache_key_component(
+                    ctx.project_agent_id.as_deref().unwrap_or("none"),
+                ),
             )
         }
         None => format!(
@@ -524,11 +534,13 @@ fn extract_upstream_error_message(error_body: &[u8]) -> Option<String> {
 }
 
 /// Fire-and-forget tasks: debit z-billing + record to aura-network.
+#[allow(clippy::too_many_arguments)]
 fn spawn_post_request_tasks(
     state: &AppState,
     user_id: &str,
     org_id: Option<&str>,
     project_id: Option<&str>,
+    agent_id: Option<&str>,
     provider_name: &str,
     model: &str,
     input_tokens: u64,
@@ -543,6 +555,7 @@ fn spawn_post_request_tasks(
     let provider_owned = provider_name.to_string();
     let org_id_owned = org_id.map(String::from);
     let project_id_owned = project_id.map(String::from);
+    let agent_id_owned = agent_id.map(String::from);
     let cost_cents = billing::cache_aware_cost_cents(
         provider_name,
         model,
@@ -597,10 +610,18 @@ fn spawn_post_request_tasks(
                 &user_id,
                 org_id_owned.as_deref(),
                 project_id_owned.as_deref(),
+                agent_id_owned.as_deref(),
                 &model,
                 input_tokens,
                 output_tokens,
-                (input_tokens + output_tokens) as f64 * 0.00001,
+                // Prefer the cache-aware cost (model-specific rate
+                // accounting for cache create/read tokens) computed
+                // above for z-billing. Fall back to the legacy flat
+                // estimate so the cost field stays populated for
+                // providers/models that lack a price entry.
+                cost_cents
+                    .map(|c| c as f64 / 100.0)
+                    .unwrap_or((input_tokens + output_tokens) as f64 * 0.00001),
                 duration_ms,
             )
             .await;
@@ -767,9 +788,9 @@ mod tests {
     #[test]
     fn openai_prompt_cache_key_uses_stable_project_agent_scope() {
         let session = aura_router_proxy::storage::SessionContext {
-            session_id: "session-ignored".to_string(),
-            project_agent_id: "agent:123".to_string(),
-            project_id: "project 456".to_string(),
+            session_id: Some("session-ignored".to_string()),
+            project_agent_id: Some("agent:123".to_string()),
+            project_id: Some("project 456".to_string()),
             org_id: Some("org-789".to_string()),
         };
 
@@ -792,9 +813,9 @@ mod tests {
     #[test]
     fn openai_provider_request_controls_add_prompt_cache_key() {
         let session = aura_router_proxy::storage::SessionContext {
-            session_id: "session-ignored".to_string(),
-            project_agent_id: "agent-a".to_string(),
-            project_id: "project-a".to_string(),
+            session_id: Some("session-ignored".to_string()),
+            project_agent_id: Some("agent-a".to_string()),
+            project_id: Some("project-a".to_string()),
             org_id: Some("org-a".to_string()),
         };
         let mut upstream = json!({
@@ -957,6 +978,7 @@ mod tests {
             "user-deepseek-billing",
             None,
             None,
+            None,
             "deepseek",
             "aura-deepseek-v4-flash",
             1_000_000,
@@ -999,6 +1021,7 @@ mod tests {
             "user-openai-billing",
             Some("org-openai"),
             Some("project-openai"),
+            None,
             "openai",
             "aura-gpt-5-5",
             1_000_000,
