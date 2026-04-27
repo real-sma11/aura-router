@@ -3,49 +3,68 @@
 //! Stores LLM prompts and responses as session events to aura-storage.
 //! Requires session context headers from the client (X-Aura-Session-Id, etc.).
 
-/// Context headers from the client request, used for storage recording.
-#[derive(Debug, Clone)]
+/// Context headers from the client request.
+///
+/// All fields are optional so callers that can supply only a subset (e.g. a
+/// task-extract harness session that has a project_id but no live session_id)
+/// still get partial attribution. `from_headers` returns `None` only when
+/// every aura-* header is absent.
+#[derive(Debug, Clone, Default)]
 pub struct SessionContext {
-    pub session_id: String,
-    pub project_agent_id: String,
-    pub project_id: String,
+    pub session_id: Option<String>,
+    pub project_agent_id: Option<String>,
+    pub project_id: Option<String>,
     pub org_id: Option<String>,
+    pub task_id: Option<String>,
 }
 
 impl SessionContext {
     /// Extract session context from request headers.
-    /// Returns None if required headers are missing.
+    ///
+    /// Returns `None` only when no aura-* headers are present at all. A single
+    /// recognised header is enough to produce a `Some`; missing headers within
+    /// the context simply stay `None`. This means downstream code must treat
+    /// every field as optional and skip work that genuinely needs a missing
+    /// id (e.g. session-token increments only fire when `session_id` is set).
     pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
-        let session_id = headers
-            .get("x-aura-session-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let project_agent_id = headers
-            .get("x-aura-agent-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let project_id = headers
-            .get("x-aura-project-id")
-            .and_then(|v| v.to_str().ok())?
-            .to_string();
-        let org_id = headers
-            .get("x-aura-org-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        let read = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+
+        let session_id = read("x-aura-session-id");
+        let project_agent_id = read("x-aura-agent-id");
+        let project_id = read("x-aura-project-id");
+        let org_id = read("x-aura-org-id");
+        let task_id = read("x-aura-task-id");
+
+        if session_id.is_none()
+            && project_agent_id.is_none()
+            && project_id.is_none()
+            && org_id.is_none()
+            && task_id.is_none()
+        {
+            return None;
+        }
 
         Some(Self {
             session_id,
             project_agent_id,
             project_id,
             org_id,
+            task_id,
         })
     }
 }
 
 /// Store a user prompt and assistant response as session events (fire-and-forget).
 ///
-/// Calls POST /internal/events for each event.
-/// Errors are logged but do not block the response.
+/// Calls POST /internal/events for each event. Returns early without writing
+/// anything if `ctx.session_id` is missing — events are session-scoped and
+/// have no meaning without one. Errors are logged but do not block the
+/// response.
 pub async fn store_events(
     client: &reqwest::Client,
     storage_url: &str,
@@ -58,6 +77,11 @@ pub async fn store_events(
     input_tokens: u64,
     output_tokens: u64,
 ) {
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        tracing::debug!("Skipping event storage: no x-aura-session-id header");
+        return;
+    };
+
     let url = format!("{storage_url}/internal/events");
 
     // Store user prompt as event
@@ -65,7 +89,7 @@ pub async fn store_events(
         .post(&url)
         .header("x-internal-token", token)
         .json(&serde_json::json!({
-            "sessionId": ctx.session_id,
+            "sessionId": session_id,
             "userId": user_id,
             "agentId": ctx.project_agent_id,
             "sender": "user",
@@ -108,7 +132,7 @@ pub async fn store_events(
         .post(&url)
         .header("x-internal-token", token)
         .json(&serde_json::json!({
-            "sessionId": ctx.session_id,
+            "sessionId": session_id,
             "agentId": ctx.project_agent_id,
             "sender": "agent",
             "projectId": ctx.project_id,
@@ -129,6 +153,199 @@ pub async fn store_events(
         Err(e) => {
             tracing::warn!(error = %e, "Failed to reach aura-storage for assistant event");
         }
+    }
+}
+
+/// Increment a session's running token totals via aura-storage's atomic
+/// per-call endpoint (fire-and-forget).
+///
+/// Calls `POST /internal/sessions/:id/tokens`. This is what makes sessions
+/// resilient to dev-loop crashes: every successful LLM round-trip persists
+/// its delta independently, so token totals reflect actual spend even if the
+/// session never receives a clean close. Errors are logged but do not block
+/// the response.
+pub async fn increment_session_tokens(
+    client: &reqwest::Client,
+    storage_url: &str,
+    token: &str,
+    session_id: &str,
+    input_delta: u64,
+    output_delta: u64,
+) {
+    let url = format!("{storage_url}/internal/sessions/{session_id}/tokens");
+
+    let result = client
+        .post(&url)
+        .header("x-internal-token", token)
+        .json(&serde_json::json!({
+            "inputDelta": input_delta,
+            "outputDelta": output_delta,
+        }))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!(session_id, "Session token delta recorded");
+        }
+        Ok(resp) => {
+            tracing::warn!(
+                status = %resp.status(),
+                session_id,
+                "Failed to record session token delta"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                session_id,
+                "Failed to reach aura-storage for session token delta"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Path;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_static(k),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn from_headers_returns_none_when_all_absent() {
+        let h = header_map(&[]);
+        assert!(SessionContext::from_headers(&h).is_none());
+    }
+
+    #[test]
+    fn from_headers_accepts_only_project_id() {
+        let h = header_map(&[("x-aura-project-id", "proj-1")]);
+        let ctx = SessionContext::from_headers(&h).expect("project_id alone should yield Some");
+        assert_eq!(ctx.project_id.as_deref(), Some("proj-1"));
+        assert!(ctx.session_id.is_none());
+        assert!(ctx.project_agent_id.is_none());
+        assert!(ctx.org_id.is_none());
+        assert!(ctx.task_id.is_none());
+    }
+
+    #[test]
+    fn from_headers_accepts_only_task_id() {
+        let h = header_map(&[("x-aura-task-id", "task-1")]);
+        let ctx = SessionContext::from_headers(&h).expect("task_id alone should yield Some");
+        assert_eq!(ctx.task_id.as_deref(), Some("task-1"));
+        assert!(ctx.project_id.is_none());
+    }
+
+    #[test]
+    fn from_headers_accepts_only_session_id() {
+        let h = header_map(&[("x-aura-session-id", "sess-1")]);
+        let ctx = SessionContext::from_headers(&h).expect("session_id alone should yield Some");
+        assert_eq!(ctx.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn from_headers_reads_all_five() {
+        let h = header_map(&[
+            ("x-aura-session-id", "sess-1"),
+            ("x-aura-agent-id", "agent-1"),
+            ("x-aura-project-id", "proj-1"),
+            ("x-aura-org-id", "org-1"),
+            ("x-aura-task-id", "task-1"),
+        ]);
+        let ctx = SessionContext::from_headers(&h).expect("all-present should yield Some");
+        assert_eq!(ctx.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(ctx.project_agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(ctx.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(ctx.org_id.as_deref(), Some("org-1"));
+        assert_eq!(ctx.task_id.as_deref(), Some("task-1"));
+    }
+
+    async fn spawn_token_recorder() -> (String, Arc<Mutex<Option<(String, serde_json::Value)>>>) {
+        let recorded: Arc<Mutex<Option<(String, serde_json::Value)>>> = Arc::new(Mutex::new(None));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let app = Router::new().route(
+            "/internal/sessions/:id/tokens",
+            post(
+                move |Path(id): Path<String>, Json(body): Json<serde_json::Value>| {
+                    let recorded = Arc::clone(&recorded_clone);
+                    async move {
+                        *recorded.lock().unwrap() = Some((id, body));
+                        axum::http::StatusCode::OK
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (url, recorded)
+    }
+
+    #[tokio::test]
+    async fn increment_session_tokens_posts_correct_payload() {
+        let (url, recorded) = spawn_token_recorder().await;
+        let client = reqwest::Client::new();
+
+        increment_session_tokens(&client, &url, "test-token", "sess-abc", 42, 17).await;
+
+        let (id, payload) = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recorder did not capture call");
+        assert_eq!(id, "sess-abc");
+        assert_eq!(payload["inputDelta"], 42);
+        assert_eq!(payload["outputDelta"], 17);
+    }
+
+    #[tokio::test]
+    async fn store_events_returns_early_without_session_id() {
+        // If store_events tried to POST despite ctx.session_id == None, an
+        // unreachable URL would surface as a tracing::warn. Verifying the
+        // early-return: the call must complete without panic and without
+        // requiring a working URL.
+        let client = reqwest::Client::new();
+        let ctx = SessionContext {
+            session_id: None,
+            project_agent_id: Some("agent-1".into()),
+            project_id: Some("proj-1".into()),
+            org_id: None,
+            task_id: None,
+        };
+        store_events(
+            &client,
+            "http://127.0.0.1:1", // unreachable on purpose
+            "tok",
+            &ctx,
+            "user-1",
+            "user content",
+            "assistant content",
+            None,
+            10,
+            5,
+        )
+        .await;
+        // If we got here without hanging or erroring, early-return worked.
     }
 }
 

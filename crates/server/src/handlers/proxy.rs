@@ -227,8 +227,11 @@ async fn handle_non_streaming(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    let org_id_ref = session_ctx.as_ref().map(|c| c.org_id.as_deref()).flatten();
-    let project_id_ref = session_ctx.as_ref().map(|c| c.project_id.as_str());
+    let org_id_ref = session_ctx.as_ref().and_then(|c| c.org_id.as_deref());
+    let project_id_ref = session_ctx.as_ref().and_then(|c| c.project_id.as_deref());
+    let agent_id_ref = session_ctx.as_ref().and_then(|c| c.project_agent_id.as_deref());
+    let task_id_ref = session_ctx.as_ref().and_then(|c| c.task_id.as_deref());
+    let session_id_ref = session_ctx.as_ref().and_then(|c| c.session_id.as_deref());
 
     let duration_ms = request_start.elapsed().as_millis() as u64;
 
@@ -237,6 +240,9 @@ async fn handle_non_streaming(
         &auth.user_id,
         org_id_ref,
         project_id_ref,
+        agent_id_ref,
+        task_id_ref,
+        session_id_ref,
         provider_name,
         model,
         input_tokens,
@@ -320,7 +326,10 @@ async fn handle_streaming(
     let billing_state = state.clone();
     let user_id = auth.user_id.clone();
     let stream_org_id = session_ctx.as_ref().and_then(|c| c.org_id.clone());
-    let stream_project_id = session_ctx.as_ref().map(|c| c.project_id.clone());
+    let stream_project_id = session_ctx.as_ref().and_then(|c| c.project_id.clone());
+    let stream_agent_id = session_ctx.as_ref().and_then(|c| c.project_agent_id.clone());
+    let stream_task_id = session_ctx.as_ref().and_then(|c| c.task_id.clone());
+    let stream_session_id = session_ctx.as_ref().and_then(|c| c.session_id.clone());
     tokio::spawn(async move {
         if let Ok(usage) = usage_rx.await {
             let duration_ms = request_start.elapsed().as_millis() as u64;
@@ -330,6 +339,9 @@ async fn handle_streaming(
                 &user_id,
                 stream_org_id.as_deref(),
                 stream_project_id.as_deref(),
+                stream_agent_id.as_deref(),
+                stream_task_id.as_deref(),
+                stream_session_id.as_deref(),
                 &provider_owned,
                 model,
                 usage.input_tokens,
@@ -432,8 +444,10 @@ fn openai_prompt_cache_key(
                 .unwrap_or_else(|| format!("user:{}", sanitize_cache_key_component(user_id)));
             format!(
                 "aura:v1:{principal}:project:{}:agent:{}:model:{model}",
-                sanitize_cache_key_component(&ctx.project_id),
-                sanitize_cache_key_component(&ctx.project_agent_id),
+                sanitize_cache_key_component(ctx.project_id.as_deref().unwrap_or("none")),
+                sanitize_cache_key_component(
+                    ctx.project_agent_id.as_deref().unwrap_or("none"),
+                ),
             )
         }
         None => format!(
@@ -529,6 +543,9 @@ fn spawn_post_request_tasks(
     user_id: &str,
     org_id: Option<&str>,
     project_id: Option<&str>,
+    agent_id: Option<&str>,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
     provider_name: &str,
     model: &str,
     input_tokens: u64,
@@ -543,6 +560,9 @@ fn spawn_post_request_tasks(
     let provider_owned = provider_name.to_string();
     let org_id_owned = org_id.map(String::from);
     let project_id_owned = project_id.map(String::from);
+    let agent_id_owned = agent_id.map(String::from);
+    let task_id_owned = task_id.map(String::from);
+    let session_id_owned = session_id.map(String::from);
     let cost_cents = billing::cache_aware_cost_cents(
         provider_name,
         model,
@@ -587,21 +607,56 @@ fn spawn_post_request_tasks(
         let client = state.http_client.clone();
         let url = network_url.clone();
         let token = network_token.clone();
-        let user_id = user_id_owned;
-        let model = model_owned;
+        let user_id = user_id_owned.clone();
+        let model = model_owned.clone();
+        let org_id_for_usage = org_id_owned.clone();
+        let project_id_for_usage = project_id_owned.clone();
+        let agent_id_for_usage = agent_id_owned.clone();
+        let task_id_for_usage = task_id_owned.clone();
         tokio::spawn(async move {
             stats::record_usage(
                 &client,
                 &url,
                 &token,
                 &user_id,
-                org_id_owned.as_deref(),
-                project_id_owned.as_deref(),
+                org_id_for_usage.as_deref(),
+                project_id_for_usage.as_deref(),
+                agent_id_for_usage.as_deref(),
+                task_id_for_usage.as_deref(),
                 &model,
                 input_tokens,
                 output_tokens,
-                (input_tokens + output_tokens) as f64 * 0.00001,
+                // Prefer cache-aware cost when available; fall back to the
+                // pre-existing flat estimate so the cost field stays
+                // populated for non-cached providers.
+                cost_cents
+                    .map(|c| c as f64 / 100.0)
+                    .unwrap_or((input_tokens + output_tokens) as f64 * 0.00001),
                 duration_ms,
+            )
+            .await;
+        });
+    }
+
+    // Per-call session token accounting. When the client supplies an
+    // x-aura-session-id, persist this round-trip's tokens to aura-storage
+    // immediately so token totals survive dev-loop crashes.
+    if let (Some(session_id), Some(ref storage_url), Some(ref storage_token)) = (
+        session_id_owned,
+        &state.aura_storage_url,
+        &state.aura_storage_token,
+    ) {
+        let client = state.http_client.clone();
+        let url = storage_url.clone();
+        let token = storage_token.clone();
+        tokio::spawn(async move {
+            storage::increment_session_tokens(
+                &client,
+                &url,
+                &token,
+                &session_id,
+                input_tokens,
+                output_tokens,
             )
             .await;
         });
@@ -767,10 +822,11 @@ mod tests {
     #[test]
     fn openai_prompt_cache_key_uses_stable_project_agent_scope() {
         let session = aura_router_proxy::storage::SessionContext {
-            session_id: "session-ignored".to_string(),
-            project_agent_id: "agent:123".to_string(),
-            project_id: "project 456".to_string(),
+            session_id: Some("session-ignored".to_string()),
+            project_agent_id: Some("agent:123".to_string()),
+            project_id: Some("project 456".to_string()),
             org_id: Some("org-789".to_string()),
+            task_id: None,
         };
 
         let key = super::openai_prompt_cache_key("user-1", "gpt-5.5", Some(&session));
@@ -792,10 +848,11 @@ mod tests {
     #[test]
     fn openai_provider_request_controls_add_prompt_cache_key() {
         let session = aura_router_proxy::storage::SessionContext {
-            session_id: "session-ignored".to_string(),
-            project_agent_id: "agent-a".to_string(),
-            project_id: "project-a".to_string(),
+            session_id: Some("session-ignored".to_string()),
+            project_agent_id: Some("agent-a".to_string()),
+            project_id: Some("project-a".to_string()),
             org_id: Some("org-a".to_string()),
+            task_id: None,
         };
         let mut upstream = json!({
             "model": "gpt-5.5",
@@ -957,6 +1014,9 @@ mod tests {
             "user-deepseek-billing",
             None,
             None,
+            None,
+            None,
+            None,
             "deepseek",
             "aura-deepseek-v4-flash",
             1_000_000,
@@ -999,6 +1059,9 @@ mod tests {
             "user-openai-billing",
             Some("org-openai"),
             Some("project-openai"),
+            None,
+            None,
+            None,
             "openai",
             "aura-gpt-5-5",
             1_000_000,
