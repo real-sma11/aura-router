@@ -1,6 +1,7 @@
 pub mod generate_3d;
 pub mod image_gen;
 pub mod proxy;
+pub mod upload;
 
 use axum::Json;
 

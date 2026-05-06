@@ -95,6 +95,57 @@ impl S3Config {
         Ok(self.public_url(&key))
     }
 
+    /// Generate a presigned PUT URL for direct client-side upload.
+    pub async fn presign_upload(
+        &self,
+        user_id: &str,
+        content_type: &str,
+        filename: &str,
+    ) -> Result<PresignedUpload, String> {
+        const ALLOWED_TYPES: &[&str] = &[
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+            "text/plain",
+            "text/markdown",
+        ];
+        if !ALLOWED_TYPES.contains(&content_type) {
+            return Err(format!("Unsupported content type: {content_type}"));
+        }
+
+        let extension = filename
+            .rsplit('.')
+            .next()
+            .unwrap_or("bin");
+        let key = Self::generate_key(user_id, "upload", extension);
+
+        let presigning_config = aws_sdk_s3::presigning::PresigningConfig::builder()
+            .expires_in(std::time::Duration::from_secs(900))
+            .build()
+            .map_err(|e| format!("Presigning config error: {e}"))?;
+
+        let presigned = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .content_type(content_type)
+            .metadata("userId", user_id)
+            .metadata("uploadedAt", &chrono::Utc::now().to_rfc3339())
+            .metadata("originalFilename", filename)
+            .presigned(presigning_config)
+            .await
+            .map_err(|e| format!("Presigning failed: {e}"))?;
+
+        Ok(PresignedUpload {
+            upload_url: presigned.uri().to_string(),
+            file_url: self.public_url(&key),
+            key,
+            expires_in: 900,
+        })
+    }
+
     /// Upload raw bytes to S3.
     /// Returns the public URL.
     pub async fn upload_bytes(
@@ -121,6 +172,15 @@ impl S3Config {
 
         Ok(self.public_url(&key))
     }
+}
+
+/// Result of a presigned upload URL generation.
+#[derive(Clone, serde::Serialize)]
+pub struct PresignedUpload {
+    pub upload_url: String,
+    pub file_url: String,
+    pub key: String,
+    pub expires_in: u64,
 }
 
 /// Apply a watermark to an image buffer.

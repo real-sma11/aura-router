@@ -26,4 +26,8 @@ pub fn create_router() -> Router<AppState> {
             "/v1/generate-3d/:taskId",
             get(handlers::generate_3d::get_3d_status),
         )
+        .route(
+            "/v1/upload/presign",
+            post(handlers::upload::presign_upload),
+        )
 }
