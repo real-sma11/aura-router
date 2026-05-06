@@ -131,9 +131,6 @@ impl S3Config {
             .bucket(&self.bucket)
             .key(&key)
             .content_type(content_type)
-            .metadata("userId", user_id)
-            .metadata("uploadedAt", &chrono::Utc::now().to_rfc3339())
-            .metadata("originalFilename", filename)
             .presigned(presigning_config)
             .await
             .map_err(|e| format!("Presigning failed: {e}"))?;
