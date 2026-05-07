@@ -44,13 +44,27 @@ pub async fn generate_image(
             .into_response());
     }
 
+    // Resolve model + provider
+    let (model, provider) =
+        image_gen::resolve_image_model(input.model.as_deref(), input.prompt_mode.as_deref());
+
+    // Cost per image at high quality, 1024x1024, with 20% markup
+    let cost_cents: i64 = match model {
+        "gpt-image-2" => 25,        // $0.211 + 20% ≈ $0.25
+        "gpt-image-1" => 20,        // $0.167 + 20% = $0.20
+        "dall-e-3" => 10,           // $0.080 + 20% ≈ $0.10
+        "dall-e-2" => 3,            // $0.020 + 20% ≈ $0.03
+        "gemini-nano-banana" => 12, // ~$0.10 + 20% = $0.12
+        _ => 25,                    // default to gpt-image-2 price
+    };
+
     // Pre-check credits
     let balance = billing::check_credits(
         &state.http_client,
         &state.z_billing_url,
         &state.z_billing_api_key,
         &auth.user_id,
-        26, // image generation minimum: 26 credits ($0.26)
+        cost_cents,
         None,
         None,
     )
@@ -59,13 +73,9 @@ pub async fn generate_image(
     if !balance.sufficient {
         return Err(AppError::InsufficientCredits {
             balance: balance.balance_cents,
-            required: 100,
+            required: cost_cents,
         });
     }
-
-    // Resolve model + provider
-    let (model, provider) =
-        image_gen::resolve_image_model(input.model.as_deref(), input.prompt_mode.as_deref());
 
     // Generate image
     let generated = match provider {
@@ -136,14 +146,7 @@ pub async fn generate_image(
         .await
         .map_err(|e| AppError::Internal(format!("S3 upload failed: {e}")))?;
 
-    // Debit credits (fire-and-forget) — flat cost per generation (+30% markup)
-    let cost_cents = match model {
-        "gpt-image-1" => 26,           // $0.26
-        "dall-e-3" => 20,              // $0.20
-        "dall-e-2" => 7,               // $0.07
-        "gemini-nano-banana" => 13,    // $0.13
-        _ => 26,                       // default
-    };
+    // Debit credits (fire-and-forget)
     {
         let client = state.http_client.clone();
         let billing_url = state.z_billing_url.clone();
@@ -257,12 +260,27 @@ pub async fn generate_image_stream(
             .into_response());
     }
 
+    let (model, provider) = image_gen::resolve_image_model(input.model.as_deref(), input.prompt_mode.as_deref());
+    let model_owned = model.to_string();
+    let provider_owned = provider.to_string();
+    let is_iteration = input.is_iteration;
+
+    // Cost per image at high quality, 1024x1024, with 20% markup
+    let cost_cents: i64 = match model {
+        "gpt-image-2" => 25,        // $0.211 + 20% ≈ $0.25
+        "gpt-image-1" => 20,        // $0.167 + 20% = $0.20
+        "dall-e-3" => 10,           // $0.080 + 20% ≈ $0.10
+        "dall-e-2" => 3,            // $0.020 + 20% ≈ $0.03
+        "gemini-nano-banana" => 12, // ~$0.10 + 20% = $0.12
+        _ => 25,                    // default to gpt-image-2 price
+    };
+
     let balance = billing::check_credits(
         &state.http_client,
         &state.z_billing_url,
         &state.z_billing_api_key,
         &auth.user_id,
-        100,
+        cost_cents,
         None,
         None,
     )
@@ -271,14 +289,9 @@ pub async fn generate_image_stream(
     if !balance.sufficient {
         return Err(AppError::InsufficientCredits {
             balance: balance.balance_cents,
-            required: 100,
+            required: cost_cents,
         });
     }
-
-    let (model, provider) = image_gen::resolve_image_model(input.model.as_deref(), input.prompt_mode.as_deref());
-    let model_owned = model.to_string();
-    let provider_owned = provider.to_string();
-    let is_iteration = input.is_iteration;
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<image_gen::ImageStreamEvent>(32);
 
@@ -437,14 +450,7 @@ pub async fn generate_image_stream(
             .await
             .ok();
 
-        // Debit credits (+30% markup)
-        let cost_cents = match gen_model.as_str() {
-            "gpt-image-1" => 26,           // $0.26
-            "dall-e-3" => 20,              // $0.20
-            "dall-e-2" => 7,               // $0.07
-            "gemini-nano-banana" => 13,    // $0.13
-            _ => 26,                       // default
-        };
+        // Debit credits
         let _ = billing::report_image_usage(
             &gen_state.http_client,
             &gen_state.z_billing_url,

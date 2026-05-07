@@ -82,8 +82,15 @@ pub struct ImageModelConfig {
 
 pub fn get_config() -> ImageGenConfig {
     ImageGenConfig {
-        default_model: "gpt-image-1".to_string(),
+        default_model: "gpt-image-2".to_string(),
         models: vec![
+            ImageModelConfig {
+                id: "gpt-image-2".to_string(),
+                name: "GPT Image 2".to_string(),
+                provider: "openai".to_string(),
+                eta_ms: 20000,
+                supports_references: true,
+            },
             ImageModelConfig {
                 id: "gpt-image-1".to_string(),
                 name: "GPT Image 1".to_string(),
@@ -106,6 +113,16 @@ pub fn get_config() -> ImageGenConfig {
                 supports_references: true,
             },
         ],
+    }
+}
+
+/// Returns the appropriate quality parameter for the given model.
+/// GPT Image models use "high", DALL-E 3 uses "hd", others have no quality param.
+fn quality_for_model(model: &str) -> Option<&'static str> {
+    match model {
+        "gpt-image-1" | "gpt-image-2" => Some("high"),
+        "dall-e-3" => Some("hd"),
+        _ => None,
     }
 }
 
@@ -144,12 +161,15 @@ async fn generate_openai_create(
     size: &str,
     model: &str,
 ) -> Result<GeneratedImage, String> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "prompt": prompt,
         "size": size,
         "n": 1
     });
+    if let Some(q) = quality_for_model(model) {
+        body["quality"] = serde_json::Value::String(q.to_string());
+    }
 
     let resp = client
         .post("https://api.openai.com/v1/images/generations")
@@ -194,7 +214,7 @@ async fn generate_openai_edit(
     let image_bytes = fetch_image_bytes(client, image_url).await?;
 
     // Build multipart form
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .text("model", model.to_string())
         .text("prompt", prompt.to_string())
         .text("size", size.to_string())
@@ -205,6 +225,9 @@ async fn generate_openai_edit(
                 .mime_str("image/png")
                 .map_err(|e| format!("MIME error: {e}"))?,
         );
+    if let Some(q) = quality_for_model(model) {
+        form = form.text("quality", q.to_string());
+    }
 
     let resp = client
         .post("https://api.openai.com/v1/images/edits")
@@ -540,7 +563,7 @@ pub async fn generate_openai_stream(
     }
 
     // Try streaming generation
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "prompt": prompt,
         "size": size,
@@ -548,6 +571,9 @@ pub async fn generate_openai_stream(
         "stream": true,
         "partial_images": 2
     });
+    if let Some(q) = quality_for_model(model) {
+        body["quality"] = serde_json::Value::String(q.to_string());
+    }
 
     let resp = client
         .post("https://api.openai.com/v1/images/generations")
@@ -663,7 +689,8 @@ pub fn resolve_image_model(model: Option<&str>, prompt_mode: Option<&str>) -> (&
         Some("dall-e-3") => ("dall-e-3", "openai"),
         Some("dall-e-2") => ("dall-e-2", "openai"),
         Some("gpt-image-1") => ("gpt-image-1", "openai"),
+        Some("gpt-image-2") => ("gpt-image-2", "openai"),
         Some("gpt-4o") => ("gpt-4o", "openai"),
-        _ => ("gpt-image-1", "openai"),
+        _ => ("gpt-image-2", "openai"),
     }
 }
