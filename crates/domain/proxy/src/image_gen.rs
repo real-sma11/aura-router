@@ -3,9 +3,6 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Style lock prompt appended to all image generation requests.
-pub const STYLE_LOCK: &str = ", standalone product only, 3/4 angle view, single object centered, fully in frame with no cropping, no other objects or elements in frame, jet black background with subtle vignette, photorealistic, high-poly, textured 3D sculpture, subject pops from background, cinematic depth, isolated product presentation";
-
 /// Image generation request.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,19 +125,14 @@ pub async fn generate_openai(
     size: &str,
     model: &str,
     images: Option<&[ImageInput]>,
-    is_iteration: bool,
+    _is_iteration: bool,
 ) -> Result<GeneratedImage, String> {
-    let full_prompt = if should_apply_style_lock(is_iteration) {
-        format!("{prompt}{STYLE_LOCK}")
-    } else {
-        prompt.to_string()
-    };
     let has_images = images.map_or(false, |imgs| !imgs.is_empty());
 
     if has_images {
-        generate_openai_edit(client, api_key, &full_prompt, size, model, images.unwrap()).await
+        generate_openai_edit(client, api_key, prompt, size, model, images.unwrap()).await
     } else {
-        generate_openai_create(client, api_key, &full_prompt, size, model).await
+        generate_openai_create(client, api_key, prompt, size, model).await
     }
 }
 
@@ -251,14 +243,8 @@ pub async fn generate_gemini(
     prompt: &str,
     size: &str,
     images: Option<&[ImageInput]>,
-    is_iteration: bool,
+    _is_iteration: bool,
 ) -> Result<GeneratedImage, String> {
-    let full_prompt = if should_apply_style_lock(is_iteration) {
-        format!("{prompt}{STYLE_LOCK}")
-    } else {
-        prompt.to_string()
-    };
-
     // Add size instruction
     let size_instruction = match size {
         "1024x1024" | "256x256" | "512x512" => " Generate a square image (1:1 aspect ratio).",
@@ -267,7 +253,7 @@ pub async fn generate_gemini(
         _ => "",
     };
 
-    let prompt_with_size = format!("{full_prompt}{size_instruction}");
+    let prompt_with_size = format!("{prompt}{size_instruction}");
 
     // Build content parts
     let mut parts = Vec::new();
@@ -509,14 +495,9 @@ pub async fn generate_openai_stream(
     size: &str,
     model: &str,
     images: Option<&[ImageInput]>,
-    is_iteration: bool,
+    _is_iteration: bool,
     event_tx: tokio::sync::mpsc::Sender<ImageStreamEvent>,
 ) -> Result<GeneratedImage, String> {
-    let full_prompt = if should_apply_style_lock(is_iteration) {
-        format!("{prompt}{STYLE_LOCK}")
-    } else {
-        prompt.to_string()
-    };
     let has_images = images.map_or(false, |imgs| !imgs.is_empty());
 
     // Send start event
@@ -545,7 +526,7 @@ pub async fn generate_openai_stream(
             .await;
 
         let result =
-            generate_openai_edit(client, api_key, &full_prompt, size, model, images.unwrap())
+            generate_openai_edit(client, api_key, prompt, size, model, images.unwrap())
                 .await?;
 
         let _ = event_tx
@@ -561,7 +542,7 @@ pub async fn generate_openai_stream(
     // Try streaming generation
     let body = serde_json::json!({
         "model": model,
-        "prompt": full_prompt,
+        "prompt": prompt,
         "size": size,
         "n": 1,
         "stream": true,
@@ -685,10 +666,4 @@ pub fn resolve_image_model(model: Option<&str>, prompt_mode: Option<&str>) -> (&
         Some("gpt-4o") => ("gpt-4o", "openai"),
         _ => ("gpt-image-1", "openai"),
     }
-}
-
-/// Whether to apply the style lock prompt.
-/// Style lock is NOT applied on iterations (matching original AURA).
-pub fn should_apply_style_lock(is_iteration: bool) -> bool {
-    !is_iteration
 }
