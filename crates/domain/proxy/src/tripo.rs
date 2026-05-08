@@ -161,7 +161,7 @@ pub async fn poll_task(
                     error: Some(user_message),
                 });
             }
-            "processing" | "queued" => {
+            "processing" | "queued" | "running" => {
                 tracing::debug!(attempt, task_id, status, "Tripo task still processing");
                 continue;
             }
