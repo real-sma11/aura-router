@@ -169,6 +169,10 @@ pub async fn create_task(
         "{VEO_API_BASE}/models/{model}:predictLongRunning"
     );
 
+    // Lite model does not support audio generation — force it off
+    // to avoid API errors.
+    let effective_audio = if model.contains("lite") { false } else { generate_audio };
+
     let body = serde_json::json!({
         "instances": [{
             "prompt": prompt
@@ -177,7 +181,7 @@ pub async fn create_task(
             "aspectRatio": aspect_ratio,
             "durationSeconds": duration_seconds,
             "resolution": resolution,
-            "generateAudio": generate_audio,
+            "generateAudio": effective_audio,
             "personGeneration": "allow_adult"
         }
     });
@@ -261,11 +265,21 @@ pub async fn poll_operation(
             return Err(message);
         }
 
-        // Extract video URI from completed response
+        // Extract video URI from completed response.
+        // Try multiple paths to handle both Gemini API and Vertex AI response formats.
         let video_uri = data
             .pointer("/response/generateVideoResponse/generatedSamples/0/video/uri")
+            .or_else(|| data.pointer("/response/videos/0/uri"))
+            .or_else(|| data.pointer("/response/generatedSamples/0/video/uri"))
             .and_then(|v| v.as_str())
-            .ok_or("No video URI in completed Veo response")?
+            .ok_or_else(|| {
+                tracing::error!(
+                    operation_name,
+                    response = %data,
+                    "Veo completed but no video URI found in response"
+                );
+                "No video URI in completed Veo response".to_string()
+            })?
             .to_string();
 
         return Ok(video_uri);
@@ -278,21 +292,14 @@ pub async fn poll_operation(
 }
 
 /// Download a video from the Veo API and return the bytes.
-/// The download URL requires the API key as a query parameter.
 pub async fn download_video(
     client: &reqwest::Client,
     api_key: &str,
     video_uri: &str,
 ) -> Result<Vec<u8>, String> {
-    // Veo video URIs require the API key appended
-    let download_url = if video_uri.contains('?') {
-        format!("{video_uri}&key={api_key}")
-    } else {
-        format!("{video_uri}?key={api_key}")
-    };
-
     let resp = client
-        .get(&download_url)
+        .get(video_uri)
+        .header("x-goog-api-key", api_key)
         .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
