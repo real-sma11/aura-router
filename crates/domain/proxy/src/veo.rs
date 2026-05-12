@@ -169,18 +169,20 @@ pub async fn create_task(
         "{VEO_API_BASE}/models/{model}:predictLongRunning"
     );
 
-    // Audio is always on for Standard/Fast and unavailable for Lite.
-    // The Veo API does not accept a generateAudio parameter — audio
-    // generation is automatic and cannot be toggled.
+    // Verified parameters from Veo API docs:
+    // - aspectRatio: "16:9" or "9:16"
+    // - durationSeconds: string "4", "6", or "8"
+    // - resolution: "720p", "1080p", "4k"
+    // - personGeneration: "allow_all" for text-to-video
     let body = serde_json::json!({
         "instances": [{
             "prompt": prompt
         }],
         "parameters": {
             "aspectRatio": aspect_ratio,
-            "durationSeconds": duration_seconds,
+            "durationSeconds": duration_seconds.to_string(),
             "resolution": resolution,
-            "personGeneration": "allow_adult"
+            "personGeneration": "allow_all"
         }
     });
 
