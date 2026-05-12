@@ -163,16 +163,15 @@ pub async fn create_task(
     aspect_ratio: &str,
     duration_seconds: u8,
     resolution: &str,
-    generate_audio: bool,
+    _generate_audio: bool,
 ) -> Result<String, String> {
     let url = format!(
         "{VEO_API_BASE}/models/{model}:predictLongRunning"
     );
 
-    // Lite model does not support audio generation — force it off
-    // to avoid API errors.
-    let effective_audio = if model.contains("lite") { false } else { generate_audio };
-
+    // Audio is always on for Standard/Fast and unavailable for Lite.
+    // The Veo API does not accept a generateAudio parameter — audio
+    // generation is automatic and cannot be toggled.
     let body = serde_json::json!({
         "instances": [{
             "prompt": prompt
@@ -181,7 +180,6 @@ pub async fn create_task(
             "aspectRatio": aspect_ratio,
             "durationSeconds": duration_seconds,
             "resolution": resolution,
-            "generateAudio": effective_audio,
             "personGeneration": "allow_adult"
         }
     });
