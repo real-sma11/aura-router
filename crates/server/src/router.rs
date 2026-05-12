@@ -27,6 +27,14 @@ pub fn create_router() -> Router<AppState> {
             get(handlers::generate_3d::get_3d_status),
         )
         .route(
+            "/v1/generate-video/stream",
+            post(handlers::generate_video::generate_video_stream),
+        )
+        .route(
+            "/v1/generate-video/config",
+            get(handlers::generate_video::generate_video_config),
+        )
+        .route(
             "/v1/upload/presign",
             post(handlers::upload::presign_upload),
         )

@@ -1,4 +1,5 @@
 pub mod generate_3d;
+pub mod generate_video;
 pub mod image_gen;
 pub mod proxy;
 pub mod upload;

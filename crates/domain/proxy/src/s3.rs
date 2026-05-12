@@ -152,7 +152,13 @@ impl S3Config {
         content_type: &str,
         extension: &str,
     ) -> Result<String, String> {
-        let asset_type = if extension == "glb" || content_type.contains("gltf") { "model" } else { "image" };
+        let asset_type = if extension == "glb" || content_type.contains("gltf") {
+            "model"
+        } else if extension == "mp4" || content_type.starts_with("video/") {
+            "video"
+        } else {
+            "image"
+        };
         let key = Self::generate_key(user_id, asset_type, extension);
 
         self.client
