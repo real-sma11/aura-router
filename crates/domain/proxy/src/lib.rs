@@ -8,3 +8,4 @@ pub mod stats;
 pub mod storage;
 pub mod stream;
 pub mod tripo;
+pub mod veo;
