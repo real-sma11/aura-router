@@ -18,6 +18,7 @@ pub struct AppState {
     pub deepseek_api_key: Option<String>,
     pub google_api_key: Option<String>,
     pub tripo_api_key: Option<String>,
+    pub ark_api_key: Option<String>,
 
     // Service URLs
     pub z_billing_url: String,

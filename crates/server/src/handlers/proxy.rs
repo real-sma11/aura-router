@@ -774,6 +774,7 @@ mod tests {
             deepseek_api_key: None,
             google_api_key: None,
             tripo_api_key: None,
+            ark_api_key: None,
             z_billing_url: billing_url,
             z_billing_api_key: "billing-test-key".to_string(),
             aura_network_url: None,
