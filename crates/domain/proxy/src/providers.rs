@@ -112,6 +112,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/kimi-k2p5",
             provider: Provider::Fireworks,
         }),
+        "aura-kimi-k2-6" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/kimi-k2p6",
+            provider: Provider::Fireworks,
+        }),
         "aura-oss-120b" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "accounts/fireworks/models/gpt-oss-120b",
@@ -204,6 +209,7 @@ pub fn max_context_tokens(model: &str) -> u64 {
         m if m.starts_with("codex") => 200_000,
         // Fireworks OSS
         "accounts/fireworks/models/kimi-k2p5" => 262_144,
+        "accounts/fireworks/models/kimi-k2p6" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
         // DeepSeek V4 direct API
@@ -279,6 +285,10 @@ mod tests {
             Some(Provider::Fireworks)
         );
         assert_eq!(
+            resolve_provider("aura-kimi-k2-6"),
+            Some(Provider::Fireworks)
+        );
+        assert_eq!(
             resolve_provider("aura-deepseek-v4-flash"),
             Some(Provider::DeepSeek)
         );
@@ -297,6 +307,13 @@ mod tests {
         let resolved = resolve_model("deepseek-chat").expect("compat alias");
         assert_eq!(resolved.upstream_model, "deepseek-chat");
         assert_eq!(resolved.provider, Provider::DeepSeek);
+    }
+
+    #[test]
+    fn resolves_kimi_k2_6_to_fireworks() {
+        let resolved = resolve_model("aura-kimi-k2-6").expect("aura alias should resolve");
+        assert_eq!(resolved.upstream_model, "accounts/fireworks/models/kimi-k2p6");
+        assert_eq!(resolved.provider, Provider::Fireworks);
     }
 
     #[test]
