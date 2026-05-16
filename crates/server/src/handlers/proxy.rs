@@ -72,23 +72,30 @@ pub async fn messages(
     let provider = resolved_model.provider;
     anthropic_compat::validate_request(provider, &request_value).map_err(AppError::BadRequest)?;
 
-    // Pre-check credits using the z-billing pricing table when possible.
-    let balance = billing::check_credits(
-        &state.http_client,
-        &state.z_billing_url,
-        &state.z_billing_api_key,
-        &auth.user_id,
-        0,
-        Some(provider.name()),
-        Some(requested_model),
-    )
-    .await?;
+    // Public-guest requests (from the logged-out aura.ai surface) skip
+    // billing entirely — cost is capped by the upstream rate limiter in
+    // aura-os-server (3 turns/guest, 30/IP/day, global daily ceiling).
+    let is_public_guest = auth.user_id == "public-guest";
 
-    if !balance.sufficient {
-        return Err(AppError::InsufficientCredits {
-            balance: balance.balance_cents,
-            required: balance.required_cents,
-        });
+    if !is_public_guest {
+        // Pre-check credits using the z-billing pricing table when possible.
+        let balance = billing::check_credits(
+            &state.http_client,
+            &state.z_billing_url,
+            &state.z_billing_api_key,
+            &auth.user_id,
+            0,
+            Some(provider.name()),
+            Some(requested_model),
+        )
+        .await?;
+
+        if !balance.sufficient {
+            return Err(AppError::InsufficientCredits {
+                balance: balance.balance_cents,
+                required: balance.required_cents,
+            });
+        }
     }
 
     // Extract session context from custom headers (optional, for storage recording)
@@ -565,8 +572,8 @@ fn spawn_post_request_tasks(
         cache_read_input_tokens,
     );
 
-    // Debit z-billing
-    {
+    // Debit z-billing (skip for public-guest — no billing account)
+    if user_id != "public-guest" {
         let client = state.http_client.clone();
         let billing_url = state.z_billing_url.clone();
         let billing_key = state.z_billing_api_key.clone();
