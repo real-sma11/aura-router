@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aura_router_auth::{InternalToken, TokenValidator};
+use aura_router_auth::{InternalToken, PublicGuestToken, TokenValidator};
 use aura_router_proxy::rate_limit::RateLimiter;
 
 /// Shared application state.
@@ -8,6 +8,7 @@ use aura_router_proxy::rate_limit::RateLimiter;
 pub struct AppState {
     pub validator: TokenValidator,
     pub internal_token: InternalToken,
+    pub public_guest_token: Option<PublicGuestToken>,
     pub http_client: reqwest::Client,
     pub rate_limiter: Arc<RateLimiter>,
 
@@ -42,5 +43,11 @@ impl AsRef<TokenValidator> for AppState {
 impl AsRef<InternalToken> for AppState {
     fn as_ref(&self) -> &InternalToken {
         &self.internal_token
+    }
+}
+
+impl AsRef<Option<PublicGuestToken>> for AppState {
+    fn as_ref(&self) -> &Option<PublicGuestToken> {
+        &self.public_guest_token
     }
 }

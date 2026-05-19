@@ -771,6 +771,7 @@ mod tests {
                 cookie_secret.to_string(),
             ),
             internal_token: InternalToken("internal-test-token".to_string()),
+            public_guest_token: None,
             http_client: reqwest::Client::new(),
             rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
                 120, 60,

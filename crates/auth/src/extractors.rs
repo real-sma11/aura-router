@@ -16,7 +16,7 @@ pub struct AuthUser {
 #[async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
-    S: Send + Sync + AsRef<TokenValidator>,
+    S: Send + Sync + AsRef<TokenValidator> + AsRef<Option<PublicGuestToken>>,
 {
     type Rejection = AppError;
 
@@ -28,7 +28,22 @@ where
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| AppError::Unauthorized("Missing authorization header".into()))?;
 
-        let validator = state.as_ref();
+        // Fast path: if the bearer token matches the dedicated public-
+        // guest service key, return the synthetic guest identity without
+        // touching JWT validation or AUTH_COOKIE_SECRET.
+        if let Some(guest_key) = <S as AsRef<Option<PublicGuestToken>>>::as_ref(state) {
+            if token == guest_key.0 {
+                return Ok(AuthUser {
+                    user_id: PUBLIC_GUEST_USER_ID.to_string(),
+                    claims: TokenClaims {
+                        id: Some(PUBLIC_GUEST_USER_ID.to_string()),
+                        sub: None,
+                    },
+                });
+            }
+        }
+
+        let validator: &TokenValidator = state.as_ref();
         let claims = validator
             .validate(token)
             .await
@@ -42,6 +57,17 @@ where
         Ok(AuthUser { user_id, claims })
     }
 }
+
+/// Optional service key that authenticates public-guest requests
+/// without JWT validation. When present in the `Authorization: Bearer`
+/// header and matching the configured value, the extractor short-
+/// circuits to `user_id = "public-guest"` — no JWT decode, no
+/// AUTH_COOKIE_SECRET needed on the calling service.
+#[derive(Clone)]
+pub struct PublicGuestToken(pub String);
+
+/// The synthetic user ID assigned to public-guest requests.
+const PUBLIC_GUEST_USER_ID: &str = "public-guest";
 
 /// Internal service auth extracted from X-Internal-Token header.
 #[derive(Debug, Clone)]
