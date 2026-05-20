@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use aura_router_auth::AuthUser;
+use aura_router_auth::{AuthUser, AuthUserOrGuest};
 use aura_router_core::AppError;
 use aura_router_proxy::{billing, seedance, storage, veo};
 use aura_router_proxy::video_types::{VideoGenConfig, VideoMeta, VideoStreamEvent};
@@ -15,7 +15,7 @@ use crate::state::AppState;
 
 /// POST /v1/generate-video/stream — Stream video generation with SSE.
 pub async fn generate_video_stream(
-    auth: AuthUser,
+    auth: AuthUserOrGuest,
     State(state): State<AppState>,
     Json(input): Json<veo::GenerateVideoRequest>,
 ) -> Result<Response, AppError> {
@@ -66,22 +66,27 @@ pub async fn generate_video_stream(
         veo::cost_cents(&input.model, &input.resolution, input.duration_seconds)
     };
 
-    let balance = billing::check_credits(
-        &state.http_client,
-        &state.z_billing_url,
-        &state.z_billing_api_key,
-        &auth.user_id,
-        cost_cents,
-        None,
-        None,
-    )
-    .await?;
+    // Public-guest requests skip billing — cost is capped by the
+    // upstream rate limiter in aura-os-server.
+    let is_public_guest = auth.is_public_guest();
+    if !is_public_guest {
+        let balance = billing::check_credits(
+            &state.http_client,
+            &state.z_billing_url,
+            &state.z_billing_api_key,
+            &auth.user_id,
+            cost_cents,
+            None,
+            None,
+        )
+        .await?;
 
-    if !balance.sufficient {
-        return Err(AppError::InsufficientCredits {
-            balance: balance.balance_cents,
-            required: cost_cents,
-        });
+        if !balance.sufficient {
+            return Err(AppError::InsufficientCredits {
+                balance: balance.balance_cents,
+                required: cost_cents,
+            });
+        }
     }
 
     let model = input.model.clone();
@@ -212,7 +217,7 @@ pub async fn generate_video_stream(
                 }
             };
 
-            // Debit credits
+            // Debit credits (skip for public-guest — silently fails, no billing account)
             let _ = billing::report_image_usage(
                 &gen_state.http_client,
                 &gen_state.z_billing_url,
@@ -380,7 +385,7 @@ pub async fn generate_video_stream(
                 }
             };
 
-            // Debit credits
+            // Debit credits (skip for public-guest — silently fails, no billing account)
             let _ = billing::report_image_usage(
                 &gen_state.http_client,
                 &gen_state.z_billing_url,

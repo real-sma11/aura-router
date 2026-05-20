@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use aura_router_auth::AuthUser;
+use aura_router_auth::{AuthUser, AuthUserOrGuest};
 use aura_router_core::AppError;
 use aura_router_proxy::{billing, storage, tripo};
 
@@ -205,7 +205,7 @@ pub async fn generate_3d(
 
 /// POST /v1/generate-3d/stream — Submit and stream 3D generation progress via SSE.
 pub async fn generate_3d_stream(
-    auth: AuthUser,
+    auth: AuthUserOrGuest,
     State(state): State<AppState>,
     Json(input): Json<tripo::Generate3dRequest>,
 ) -> Result<Response, AppError> {
@@ -233,22 +233,26 @@ pub async fn generate_3d_stream(
             .into_response());
     }
 
-    let balance = billing::check_credits(
-        &state.http_client,
-        &state.z_billing_url,
-        &state.z_billing_api_key,
-        &auth.user_id,
-        50,
-        None,
-        None,
-    )
-    .await?;
+    // Public-guest requests skip billing — cost is capped by the
+    // upstream rate limiter in aura-os-server.
+    if !auth.is_public_guest() {
+        let balance = billing::check_credits(
+            &state.http_client,
+            &state.z_billing_url,
+            &state.z_billing_api_key,
+            &auth.user_id,
+            50,
+            None,
+            None,
+        )
+        .await?;
 
-    if !balance.sufficient {
-        return Err(AppError::InsufficientCredits {
-            balance: balance.balance_cents,
-            required: 50,
-        });
+        if !balance.sufficient {
+            return Err(AppError::InsufficientCredits {
+                balance: balance.balance_cents,
+                required: 50,
+            });
+        }
     }
 
     // Upload data URL to S3 if needed

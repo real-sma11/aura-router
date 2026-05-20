@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use aura_router_auth::AuthUser;
+use aura_router_auth::{AuthUser, AuthUserOrGuest};
 use aura_router_core::AppError;
 use aura_router_proxy::{billing, image_gen, s3, storage};
 
@@ -233,7 +233,7 @@ pub async fn generate_image(
 
 /// POST /v1/generate-image/stream — Stream image generation with SSE.
 pub async fn generate_image_stream(
-    auth: AuthUser,
+    auth: AuthUserOrGuest,
     State(state): State<AppState>,
     Json(input): Json<image_gen::GenerateImageRequest>,
 ) -> Result<Response, AppError> {
@@ -275,28 +275,33 @@ pub async fn generate_image_stream(
         _ => 25,                    // default to gpt-image-2 price
     };
 
-    let balance = billing::check_credits(
-        &state.http_client,
-        &state.z_billing_url,
-        &state.z_billing_api_key,
-        &auth.user_id,
-        cost_cents,
-        None,
-        None,
-    )
-    .await?;
+    // Public-guest requests skip billing — cost is capped by the
+    // upstream rate limiter in aura-os-server.
+    if !auth.is_public_guest() {
+        let balance = billing::check_credits(
+            &state.http_client,
+            &state.z_billing_url,
+            &state.z_billing_api_key,
+            &auth.user_id,
+            cost_cents,
+            None,
+            None,
+        )
+        .await?;
 
-    if !balance.sufficient {
-        return Err(AppError::InsufficientCredits {
-            balance: balance.balance_cents,
-            required: cost_cents,
-        });
+        if !balance.sufficient {
+            return Err(AppError::InsufficientCredits {
+                balance: balance.balance_cents,
+                required: cost_cents,
+            });
+        }
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<image_gen::ImageStreamEvent>(32);
 
     // Spawn the generation task
     let gen_state = state.clone();
+    let gen_is_public_guest = auth.is_public_guest();
     let gen_user_id = auth.user_id.clone();
     let gen_prompt = input.prompt.clone();
     let gen_size = input.size.clone();
@@ -450,18 +455,20 @@ pub async fn generate_image_stream(
             .await
             .ok();
 
-        // Debit credits
-        let _ = billing::report_image_usage(
-            &gen_state.http_client,
-            &gen_state.z_billing_url,
-            &gen_state.z_billing_api_key,
-            &uuid::Uuid::new_v4().to_string(),
-            &gen_user_id,
-            &gen_provider,
-            &gen_model,
-            cost_cents,
-        )
-        .await;
+        // Debit credits (skip for public-guest)
+        if !gen_is_public_guest {
+            let _ = billing::report_image_usage(
+                &gen_state.http_client,
+                &gen_state.z_billing_url,
+                &gen_state.z_billing_api_key,
+                &uuid::Uuid::new_v4().to_string(),
+                &gen_user_id,
+                &gen_provider,
+                &gen_model,
+                cost_cents,
+            )
+            .await;
+        }
 
         // Auto-store artifact and capture ID for the completed event
         let mut artifact_id = None;

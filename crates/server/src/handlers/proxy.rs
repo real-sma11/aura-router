@@ -5,7 +5,7 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use aura_router_auth::AuthUser;
+use aura_router_auth::{AuthUser, AuthUserOrGuest};
 use aura_router_core::AppError;
 use aura_router_proxy::{anthropic_compat, billing, providers, stats, storage, stream};
 
@@ -23,7 +23,7 @@ use crate::state::AppState;
 /// 7. Debit credits + record usage (fire-and-forget)
 /// 8. Return response
 pub async fn messages(
-    auth: AuthUser,
+    auth: AuthUserOrGuest,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
@@ -154,6 +154,8 @@ pub async fn messages(
 
     let upstream_status = upstream_resp.status();
     let provider_name = provider.name();
+    // Convert to AuthUser for internal functions (same fields, stricter type).
+    let auth = auth.into_auth_user();
 
     // Normalize upstream failures into Anthropic-compatible error envelopes.
     if !upstream_status.is_success() {
@@ -771,7 +773,7 @@ mod tests {
                 cookie_secret.to_string(),
             ),
             internal_token: InternalToken("internal-test-token".to_string()),
-            public_guest_token: None,
+            public_rate_limiter: std::sync::Arc::new(aura_router_auth::PublicRateLimiter::new()),
             http_client: reqwest::Client::new(),
             rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
                 120, 60,
