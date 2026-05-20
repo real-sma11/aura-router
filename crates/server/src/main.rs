@@ -6,7 +6,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use aura_router_auth::{InternalToken, PublicGuestToken, TokenValidator};
+use aura_router_auth::{InternalToken, PublicRateLimiter, TokenValidator};
 
 use crate::state::AppState;
 
@@ -80,18 +80,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Watermark image loaded");
     }
 
-    let public_guest_token = std::env::var("AURA_PUBLIC_GUEST_KEY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PublicGuestToken);
-    if public_guest_token.is_some() {
-        tracing::info!("Public guest service key configured");
-    }
+    let public_rate_limiter = std::sync::Arc::new(PublicRateLimiter::new());
+    tracing::info!("Public-guest IP rate limiter ready");
 
     let state = AppState {
         validator,
         internal_token: InternalToken(internal_token),
-        public_guest_token,
+        public_rate_limiter,
         http_client: reqwest::Client::new(),
         rate_limiter: std::sync::Arc::new(aura_router_proxy::rate_limit::RateLimiter::new(
             rate_limit_rpm,

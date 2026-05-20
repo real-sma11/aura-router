@@ -24,6 +24,9 @@ pub enum AppError {
     #[error("Billing service error: {0}")]
     BillingError(String),
 
+    #[error("Rate limited: {message}")]
+    RateLimited { retry_after: u64, message: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -38,6 +41,7 @@ impl IntoResponse for AppError {
             AppError::InsufficientCredits { .. } => {
                 (StatusCode::PAYMENT_REQUIRED, "INSUFFICIENT_CREDITS")
             }
+            AppError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             AppError::ProviderError(_) => (StatusCode::BAD_GATEWAY, "PROVIDER_ERROR"),
             AppError::BillingError(_) => (StatusCode::SERVICE_UNAVAILABLE, "BILLING_UNAVAILABLE"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
