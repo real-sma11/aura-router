@@ -32,6 +32,11 @@ pub struct ResolvedModel<'a> {
 
 fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
     match model {
+        "aura-claude-opus-4-8" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-opus-4-8",
+            provider: Provider::Anthropic,
+        }),
         "aura-claude-opus-4-7" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "claude-opus-4-7",
