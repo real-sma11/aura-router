@@ -106,6 +106,7 @@ pub async fn generate_image(
                 &input.prompt,
                 &input.size,
                 model,
+                input.quality.as_deref(),
                 input.images.as_deref(),
                 input.is_iteration,
             )
@@ -305,6 +306,7 @@ pub async fn generate_image_stream(
     let gen_user_id = auth.user_id.clone();
     let gen_prompt = input.prompt.clone();
     let gen_size = input.size.clone();
+    let gen_quality = input.quality.clone();
     let gen_images = input.images.clone();
     let gen_model = model_owned.clone();
     let gen_provider = provider_owned.clone();
@@ -392,6 +394,7 @@ pub async fn generate_image_stream(
                 &gen_prompt,
                 &gen_size,
                 &gen_model,
+                gen_quality.as_deref(),
                 gen_images.as_deref(),
                 is_iteration,
                 event_tx_clone.clone(),

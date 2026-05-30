@@ -11,6 +11,9 @@ pub struct GenerateImageRequest {
     #[serde(default = "default_size")]
     pub size: String,
     pub model: Option<String>,
+    /// Caller-requested image quality. Validated per model in
+    /// [`resolve_quality`]; ignored when absent or unsupported.
+    pub quality: Option<String>,
     pub images: Option<Vec<ImageInput>>,
     pub prompt_mode: Option<String>,
     #[serde(default)]
@@ -116,12 +119,26 @@ pub fn get_config() -> ImageGenConfig {
     }
 }
 
-/// Returns the appropriate quality parameter for the given model.
-/// GPT Image models use "high", DALL-E 3 uses "hd", others have no quality param.
-fn quality_for_model(model: &str) -> Option<&'static str> {
+/// Resolve the OpenAI `quality` parameter for a model, honoring a
+/// caller-supplied preference when it is valid for that model.
+///
+/// GPT Image models accept `low` / `medium` / `high` / `auto` (defaulting
+/// to `high` for backward compatibility when nothing valid is requested).
+/// DALL-E 3 accepts `standard` / `hd` (defaulting to `hd`). Other models
+/// have no quality parameter.
+fn resolve_quality(model: &str, requested: Option<&str>) -> Option<String> {
+    let normalized = requested.map(|s| s.trim().to_ascii_lowercase());
     match model {
-        "gpt-image-1" | "gpt-image-2" => Some("high"),
-        "dall-e-3" => Some("hd"),
+        "gpt-image-1" | "gpt-image-2" => Some(
+            normalized
+                .filter(|q| matches!(q.as_str(), "low" | "medium" | "high" | "auto"))
+                .unwrap_or_else(|| "high".to_string()),
+        ),
+        "dall-e-3" => Some(
+            normalized
+                .filter(|q| matches!(q.as_str(), "standard" | "hd"))
+                .unwrap_or_else(|| "hd".to_string()),
+        ),
         _ => None,
     }
 }
@@ -141,15 +158,16 @@ pub async fn generate_openai(
     prompt: &str,
     size: &str,
     model: &str,
+    quality: Option<&str>,
     images: Option<&[ImageInput]>,
     _is_iteration: bool,
 ) -> Result<GeneratedImage, String> {
     let has_images = images.map_or(false, |imgs| !imgs.is_empty());
 
     if has_images {
-        generate_openai_edit(client, api_key, prompt, size, model, images.unwrap()).await
+        generate_openai_edit(client, api_key, prompt, size, model, quality, images.unwrap()).await
     } else {
-        generate_openai_create(client, api_key, prompt, size, model).await
+        generate_openai_create(client, api_key, prompt, size, model, quality).await
     }
 }
 
@@ -160,6 +178,7 @@ async fn generate_openai_create(
     prompt: &str,
     size: &str,
     model: &str,
+    quality: Option<&str>,
 ) -> Result<GeneratedImage, String> {
     let mut body = serde_json::json!({
         "model": model,
@@ -167,8 +186,8 @@ async fn generate_openai_create(
         "size": size,
         "n": 1
     });
-    if let Some(q) = quality_for_model(model) {
-        body["quality"] = serde_json::Value::String(q.to_string());
+    if let Some(q) = resolve_quality(model, quality) {
+        body["quality"] = serde_json::Value::String(q);
     }
 
     let resp = client
@@ -207,6 +226,7 @@ async fn generate_openai_edit(
     prompt: &str,
     size: &str,
     model: &str,
+    quality: Option<&str>,
     images: &[ImageInput],
 ) -> Result<GeneratedImage, String> {
     // Fetch first reference image as bytes
@@ -225,8 +245,8 @@ async fn generate_openai_edit(
                 .mime_str("image/png")
                 .map_err(|e| format!("MIME error: {e}"))?,
         );
-    if let Some(q) = quality_for_model(model) {
-        form = form.text("quality", q.to_string());
+    if let Some(q) = resolve_quality(model, quality) {
+        form = form.text("quality", q);
     }
 
     let resp = client
@@ -241,7 +261,7 @@ async fn generate_openai_edit(
         let error = resp.text().await.unwrap_or_default();
         // Fallback to generation without references
         tracing::warn!("OpenAI edit failed, falling back to generation: {error}");
-        return generate_openai_create(client, api_key, prompt, size, model).await;
+        return generate_openai_create(client, api_key, prompt, size, model, quality).await;
     }
 
     let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
@@ -517,6 +537,7 @@ pub async fn generate_openai_stream(
     prompt: &str,
     size: &str,
     model: &str,
+    quality: Option<&str>,
     images: Option<&[ImageInput]>,
     _is_iteration: bool,
     event_tx: tokio::sync::mpsc::Sender<ImageStreamEvent>,
@@ -549,7 +570,7 @@ pub async fn generate_openai_stream(
             .await;
 
         let result =
-            generate_openai_edit(client, api_key, prompt, size, model, images.unwrap())
+            generate_openai_edit(client, api_key, prompt, size, model, quality, images.unwrap())
                 .await?;
 
         let _ = event_tx
@@ -571,8 +592,8 @@ pub async fn generate_openai_stream(
         "stream": true,
         "partial_images": 2
     });
-    if let Some(q) = quality_for_model(model) {
-        body["quality"] = serde_json::Value::String(q.to_string());
+    if let Some(q) = resolve_quality(model, quality) {
+        body["quality"] = serde_json::Value::String(q);
     }
 
     let resp = client
