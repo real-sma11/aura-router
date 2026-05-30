@@ -22,12 +22,60 @@ pub fn request_to_upstream(
         Provider::Anthropic => {
             let mut next = request.clone();
             next["model"] = Value::String(upstream_model.to_string());
+            // The provider-neutral `reasoning_effort` hint is for
+            // OpenAI-family translation only. Anthropic encodes effort
+            // in `output_config`/`thinking` and would 400 on the unknown
+            // top-level key, so strip it before forwarding.
+            if let Some(obj) = next.as_object_mut() {
+                obj.remove("reasoning_effort");
+            }
             Ok(next)
         }
         Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
             validate_openai_request(request)?;
-            anthropic_request_to_openai(request, upstream_model)
+            let mut upstream = anthropic_request_to_openai(request, upstream_model)?;
+            apply_reasoning_effort(provider, request, &mut upstream);
+            Ok(upstream)
         }
+    }
+}
+
+/// Translate the provider-neutral `reasoning_effort` tier carried on the
+/// inbound `/v1/messages` body into each provider's native control.
+///
+/// `anthropic_request_to_openai` builds a fresh upstream object, so the
+/// neutral hint never leaks through on its own — it is only attached
+/// here, clamped to the values the target provider accepts:
+/// - OpenAI accepts `minimal`/`low`/`medium`/`high` (no `max`/`xhigh`,
+///   which fold to `high`).
+/// - Fireworks open-weight models (e.g. GPT-OSS) accept
+///   `low`/`medium`/`high` (`minimal` folds to `low`).
+/// - DeepSeek has no discrete effort knob, so the hint is dropped.
+fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Value) {
+    let Some(tier) = request.get("reasoning_effort").and_then(Value::as_str) else {
+        return;
+    };
+    let mapped = match provider {
+        Provider::OpenAi => match tier.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Some("minimal"),
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
+        },
+        Provider::Fireworks => match tier.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
+        },
+        Provider::Anthropic | Provider::DeepSeek => None,
+    };
+    if let (Some(effort), Some(obj)) = (mapped, upstream.as_object_mut()) {
+        obj.insert(
+            "reasoning_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
     }
 }
 
@@ -636,6 +684,90 @@ mod tests {
     };
     use crate::providers::Provider;
     use serde_json::{json, Value};
+
+    #[test]
+    fn translates_reasoning_effort_to_openai_native() {
+        let request = json!({
+            "model": "aura-gpt-5-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "minimal"
+        });
+        let upstream =
+            request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("minimal".to_string())
+        );
+
+        // OpenAI has no `max`; it folds to `high`.
+        let request = json!({
+            "model": "aura-gpt-5-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "max"
+        });
+        let upstream =
+            request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("high".to_string())
+        );
+    }
+
+    #[test]
+    fn folds_minimal_to_low_for_fireworks_open_weight() {
+        let request = json!({
+            "model": "aura-oss-120b",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "minimal"
+        });
+        let upstream = request_to_upstream(Provider::Fireworks, "gpt-oss-120b", &request)
+            .expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("low".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_reasoning_effort_for_anthropic_upstream() {
+        let request = json!({
+            "model": "aura-claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "output_config": {"effort": "high"},
+            "reasoning_effort": "max"
+        });
+        let upstream = request_to_upstream(Provider::Anthropic, "claude-sonnet-4-6", &request)
+            .expect("translation");
+        assert!(
+            upstream.get("reasoning_effort").is_none(),
+            "Anthropic must not receive the neutral hint: {upstream}"
+        );
+        // The Anthropic-native effort control is left untouched.
+        assert_eq!(
+            upstream["output_config"]["effort"],
+            Value::String("high".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_reasoning_effort_for_deepseek() {
+        let request = json!({
+            "model": "aura-deepseek-v4-pro",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "high"
+        });
+        let upstream = request_to_upstream(Provider::DeepSeek, "deepseek-chat", &request)
+            .expect("translation");
+        assert!(
+            upstream.get("reasoning_effort").is_none(),
+            "DeepSeek has no effort knob: {upstream}"
+        );
+    }
 
     #[test]
     fn translates_anthropic_request_to_openai_tools_format() {
