@@ -317,7 +317,10 @@ mod tests {
     #[test]
     fn resolves_kimi_k2_6_to_fireworks() {
         let resolved = resolve_model("aura-kimi-k2-6").expect("aura alias should resolve");
-        assert_eq!(resolved.upstream_model, "accounts/fireworks/models/kimi-k2p6");
+        assert_eq!(
+            resolved.upstream_model,
+            "accounts/fireworks/models/kimi-k2p6"
+        );
         assert_eq!(resolved.provider, Provider::Fireworks);
     }
 

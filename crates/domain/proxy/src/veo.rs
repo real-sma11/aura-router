@@ -73,9 +73,7 @@ pub async fn create_task(
     resolution: &str,
     _generate_audio: bool,
 ) -> Result<String, String> {
-    let url = format!(
-        "{VEO_API_BASE}/models/{model}:predictLongRunning"
-    );
+    let url = format!("{VEO_API_BASE}/models/{model}:predictLongRunning");
 
     let body = serde_json::json!({
         "instances": [{
@@ -149,8 +147,7 @@ pub async fn poll_operation(
             continue;
         }
 
-        let data: serde_json::Value =
-            resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         let done = data["done"].as_bool().unwrap_or(false);
 
@@ -218,10 +215,7 @@ pub async fn download_video(
         .map_err(|e| format!("Failed to read video bytes: {e}"))?;
 
     if bytes.len() > 200 * 1024 * 1024 {
-        return Err(format!(
-            "Video too large: {}MB",
-            bytes.len() / 1024 / 1024
-        ));
+        return Err(format!("Video too large: {}MB", bytes.len() / 1024 / 1024));
     }
 
     Ok(bytes.to_vec())

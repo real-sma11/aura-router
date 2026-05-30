@@ -127,15 +127,15 @@ fn anthropic_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 1500.0,
             input_tokens_is_new_only: true,
         }),
-        "claude-haiku-4-5"
-        | "claude-haiku-4-5-20251001"
-        | "aura-claude-haiku-4-5" => Some(CacheAwareRates {
-            new_input_cents_per_million: 100.0,
-            cache_write_input_cents_per_million: 125.0,
-            cache_read_input_cents_per_million: 10.0,
-            output_cents_per_million: 500.0,
-            input_tokens_is_new_only: true,
-        }),
+        "claude-haiku-4-5" | "claude-haiku-4-5-20251001" | "aura-claude-haiku-4-5" => {
+            Some(CacheAwareRates {
+                new_input_cents_per_million: 100.0,
+                cache_write_input_cents_per_million: 125.0,
+                cache_read_input_cents_per_million: 10.0,
+                output_cents_per_million: 500.0,
+                input_tokens_is_new_only: true,
+            })
+        }
         _ => None,
     }
 }
@@ -444,14 +444,7 @@ mod tests {
         );
         // Unknown provider with cache buckets still returns None.
         assert_eq!(
-            cache_aware_cost_cents(
-                "cohere",
-                "command-r-plus",
-                1_000_000,
-                500_000,
-                0,
-                1_000_000,
-            ),
+            cache_aware_cost_cents("cohere", "command-r-plus", 1_000_000, 500_000, 0, 1_000_000,),
             None
         );
     }
@@ -541,10 +534,8 @@ mod tests {
     #[test]
     fn anthropic_aura_aliases_resolve_to_same_rates() {
         // aura-* aliases must produce identical costs to canonical model names.
-        let canonical =
-            cache_aware_cost_cents("anthropic", "claude-opus-4-7", 1, 595, 0, 50_000);
-        let alias =
-            cache_aware_cost_cents("anthropic", "aura-claude-opus-4-7", 1, 595, 0, 50_000);
+        let canonical = cache_aware_cost_cents("anthropic", "claude-opus-4-7", 1, 595, 0, 50_000);
+        let alias = cache_aware_cost_cents("anthropic", "aura-claude-opus-4-7", 1, 595, 0, 50_000);
         assert_eq!(canonical, alias);
         assert!(canonical.is_some());
     }
@@ -625,14 +616,7 @@ mod tests {
             0,
             80_000,
         );
-        let alias = cache_aware_cost_cents(
-            "fireworks",
-            "aura-kimi-k2-5",
-            100_000,
-            500,
-            0,
-            80_000,
-        );
+        let alias = cache_aware_cost_cents("fireworks", "aura-kimi-k2-5", 100_000, 500, 0, 80_000);
         assert_eq!(canonical, alias);
         assert!(canonical.is_some());
     }

@@ -206,7 +206,10 @@ pub async fn store_artifact(
     match result {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let id = body.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let id = body
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 tracing::debug!("Artifact stored to aura-storage");
                 id
             } else {
@@ -233,10 +236,7 @@ mod tests {
     fn header_map(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
-            h.insert(
-                axum::http::HeaderName::from_static(k),
-                v.parse().unwrap(),
-            );
+            h.insert(axum::http::HeaderName::from_static(k), v.parse().unwrap());
         }
         h
     }

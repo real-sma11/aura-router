@@ -136,8 +136,7 @@ pub async fn create_task(
         return Err(format!("Seedance error: {error}"));
     }
 
-    let data: serde_json::Value =
-        resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
     let task_id = data["id"]
         .as_str()
@@ -183,8 +182,7 @@ pub async fn poll_task(
             continue;
         }
 
-        let data: serde_json::Value =
-            resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         let status = data["status"].as_str().unwrap_or("");
 
@@ -232,10 +230,7 @@ pub async fn poll_task(
 ///
 /// Seedance video URLs are public TOS URLs — no auth header needed.
 /// URLs expire after 24 hours, so we download immediately and re-upload to S3.
-pub async fn download_video(
-    client: &reqwest::Client,
-    video_url: &str,
-) -> Result<Vec<u8>, String> {
+pub async fn download_video(client: &reqwest::Client, video_url: &str) -> Result<Vec<u8>, String> {
     let resp = client
         .get(video_url)
         .timeout(std::time::Duration::from_secs(60))
@@ -253,10 +248,7 @@ pub async fn download_video(
         .map_err(|e| format!("Failed to read video bytes: {e}"))?;
 
     if bytes.len() > 200 * 1024 * 1024 {
-        return Err(format!(
-            "Video too large: {}MB",
-            bytes.len() / 1024 / 1024
-        ));
+        return Err(format!("Video too large: {}MB", bytes.len() / 1024 / 1024));
     }
 
     Ok(bytes.to_vec())

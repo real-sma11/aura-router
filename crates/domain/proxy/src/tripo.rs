@@ -112,8 +112,7 @@ pub async fn poll_task(
             continue;
         }
 
-        let data: serde_json::Value =
-            resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {e}"))?;
 
         let status = data
             .pointer("/data/status")
@@ -137,9 +136,7 @@ pub async fn poll_task(
                 });
             }
             "failed" => {
-                let error_code = data
-                    .pointer("/data/error_code")
-                    .and_then(|v| v.as_u64());
+                let error_code = data.pointer("/data/error_code").and_then(|v| v.as_u64());
                 let error_message = data
                     .pointer("/data/error_message")
                     .or_else(|| data.pointer("/data/message"))
@@ -206,7 +203,8 @@ pub async fn check_task_status(
         .to_string();
 
     let glb_url = if status == "success" {
-        data.pointer("/data/output").and_then(|o| extract_glb_url(o))
+        data.pointer("/data/output")
+            .and_then(|o| extract_glb_url(o))
     } else {
         None
     };

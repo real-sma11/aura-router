@@ -165,7 +165,16 @@ pub async fn generate_openai(
     let has_images = images.map_or(false, |imgs| !imgs.is_empty());
 
     if has_images {
-        generate_openai_edit(client, api_key, prompt, size, model, quality, images.unwrap()).await
+        generate_openai_edit(
+            client,
+            api_key,
+            prompt,
+            size,
+            model,
+            quality,
+            images.unwrap(),
+        )
+        .await
     } else {
         generate_openai_create(client, api_key, prompt, size, model, quality).await
     }
@@ -382,7 +391,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             || v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             || v4.is_link_local()     // 169.254.0.0/16 (cloud metadata)
             || v4.is_unspecified()    // 0.0.0.0
-            || v4.is_broadcast()      // 255.255.255.255
+            || v4.is_broadcast() // 255.255.255.255
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()          // ::1
@@ -441,10 +450,7 @@ fn no_redirect_client() -> reqwest::Client {
 async fn fetch_image_bytes(_client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if url.starts_with("data:") {
         // Base64 data URL
-        let b64 = url
-            .find(',')
-            .map(|i| &url[i + 1..])
-            .unwrap_or(url);
+        let b64 = url.find(',').map(|i| &url[i + 1..]).unwrap_or(url);
         return base64::engine::general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("Invalid base64: {e}"));
@@ -569,9 +575,16 @@ pub async fn generate_openai_stream(
             })
             .await;
 
-        let result =
-            generate_openai_edit(client, api_key, prompt, size, model, quality, images.unwrap())
-                .await?;
+        let result = generate_openai_edit(
+            client,
+            api_key,
+            prompt,
+            size,
+            model,
+            quality,
+            images.unwrap(),
+        )
+        .await?;
 
         let _ = event_tx
             .send(ImageStreamEvent::Progress {
@@ -695,7 +708,10 @@ pub async fn generate_openai_stream(
 /// If promptMode is set, it overrides explicit model selection (matching original AURA):
 /// - "new" or "remix" → gpt-image-1
 /// - "edit" → gemini-nano-banana
-pub fn resolve_image_model(model: Option<&str>, prompt_mode: Option<&str>) -> (&'static str, &'static str) {
+pub fn resolve_image_model(
+    model: Option<&str>,
+    prompt_mode: Option<&str>,
+) -> (&'static str, &'static str) {
     // promptMode takes precedence if set
     if let Some(mode) = prompt_mode {
         return match mode {

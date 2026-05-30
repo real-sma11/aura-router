@@ -82,10 +82,7 @@ pub enum VideoStreamEvent {
     #[serde(rename = "progress")]
     Progress { percent: u8, message: String },
     #[serde(rename = "completed")]
-    Completed {
-        video_url: String,
-        meta: VideoMeta,
-    },
+    Completed { video_url: String, meta: VideoMeta },
     #[serde(rename = "error")]
     Error { code: String, message: String },
 }

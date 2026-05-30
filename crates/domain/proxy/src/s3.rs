@@ -61,11 +61,7 @@ impl S3Config {
 
     /// Upload a base64-encoded image to S3.
     /// Returns the public URL.
-    pub async fn upload_base64(
-        &self,
-        data_url: &str,
-        user_id: &str,
-    ) -> Result<String, String> {
+    pub async fn upload_base64(&self, data_url: &str, user_id: &str) -> Result<String, String> {
         let (content_type, extension) = Self::detect_image_type(data_url);
 
         // Strip data URL prefix
@@ -114,10 +110,7 @@ impl S3Config {
             return Err(format!("Unsupported content type: {content_type}"));
         }
 
-        let extension = filename
-            .rsplit('.')
-            .next()
-            .unwrap_or("bin");
+        let extension = filename.rsplit('.').next().unwrap_or("bin");
         let key = Self::generate_key(user_id, "upload", extension);
 
         let presigning_config = aws_sdk_s3::presigning::PresigningConfig::builder()
@@ -189,10 +182,7 @@ pub struct PresignedUpload {
 /// Apply a watermark to an image buffer.
 /// Composites the watermark in the bottom-right corner.
 /// Returns the watermarked image as PNG bytes.
-pub fn apply_watermark(
-    image_bytes: &[u8],
-    watermark_bytes: &[u8],
-) -> Result<Vec<u8>, String> {
+pub fn apply_watermark(image_bytes: &[u8], watermark_bytes: &[u8]) -> Result<Vec<u8>, String> {
     use image::{GenericImageView, ImageReader};
     use std::io::Cursor;
 
@@ -226,7 +216,12 @@ pub fn apply_watermark(
     let y = main_h.saturating_sub(wm_h + padding);
 
     let mut output = main_img.to_rgba8();
-    image::imageops::overlay(&mut output, &watermark_resized.to_rgba8(), x as i64, y as i64);
+    image::imageops::overlay(
+        &mut output,
+        &watermark_resized.to_rgba8(),
+        x as i64,
+        y as i64,
+    );
 
     let mut buf = Vec::new();
     let mut cursor = Cursor::new(&mut buf);
