@@ -151,8 +151,6 @@ pub async fn messages(
     apply_provider_request_controls(
         provider,
         &mut upstream_request_value,
-        &auth.user_id,
-        resolved_model.upstream_model,
         session_ctx.as_ref(),
     );
     let upstream_body = serde_json::to_vec(&upstream_request_value)
@@ -439,74 +437,27 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
 fn apply_provider_request_controls(
     provider: providers::Provider,
     upstream_body: &mut serde_json::Value,
-    user_id: &str,
-    upstream_model: &str,
     session_ctx: Option<&storage::SessionContext>,
 ) {
     if provider != providers::Provider::OpenAi {
         return;
     }
 
+    // The harness owns `prompt_cache_key` derivation and clamps it to
+    // OpenAI's 64-char limit before threading it via the
+    // `X-Aura-Prompt-Cache-Key` header. The router forwards that value
+    // verbatim and never synthesizes its own (a router-built
+    // org/project/agent/model key overran the 64-char limit and tripped
+    // OpenAI's `invalid_request_error`). When no key is threaded, the
+    // request simply goes out without one (no prompt caching).
+    let Some(cache_key) = session_ctx.and_then(|ctx| ctx.prompt_cache_key.as_deref()) else {
+        return;
+    };
     let Some(body) = upstream_body.as_object_mut() else {
         return;
     };
-    body.entry("prompt_cache_key").or_insert_with(|| {
-        serde_json::Value::String(openai_prompt_cache_key(
-            user_id,
-            upstream_model,
-            session_ctx,
-        ))
-    });
-}
-
-fn openai_prompt_cache_key(
-    user_id: &str,
-    upstream_model: &str,
-    session_ctx: Option<&storage::SessionContext>,
-) -> String {
-    let model = sanitize_cache_key_component(upstream_model);
-    match session_ctx {
-        Some(ctx) => {
-            let principal = ctx
-                .org_id
-                .as_deref()
-                .map(|org_id| format!("org:{}", sanitize_cache_key_component(org_id)))
-                .unwrap_or_else(|| format!("user:{}", sanitize_cache_key_component(user_id)));
-            // Cache key components fall back to "none" placeholders when
-            // headers are absent. The user_id / org_id principal still
-            // segregates per-tenant, so missing project/agent ids share
-            // a bucket within a single principal — acceptable.
-            format!(
-                "aura:v1:{principal}:project:{}:agent:{}:model:{model}",
-                sanitize_cache_key_component(ctx.project_id.as_deref().unwrap_or("none")),
-                sanitize_cache_key_component(ctx.project_agent_id.as_deref().unwrap_or("none"),),
-            )
-        }
-        None => format!(
-            "aura:v1:user:{}:model:{model}",
-            sanitize_cache_key_component(user_id)
-        ),
-    }
-}
-
-fn sanitize_cache_key_component(value: &str) -> String {
-    let sanitized: String = value
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(96)
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
+    body.entry("prompt_cache_key")
+        .or_insert_with(|| serde_json::Value::String(cache_key.to_string()));
 }
 
 fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
@@ -824,37 +775,13 @@ mod tests {
     }
 
     #[test]
-    fn openai_prompt_cache_key_uses_stable_project_agent_scope() {
-        let session = aura_router_proxy::storage::SessionContext {
-            session_id: Some("session-ignored".to_string()),
-            project_agent_id: Some("agent:123".to_string()),
-            project_id: Some("project 456".to_string()),
-            org_id: Some("org-789".to_string()),
-        };
-
-        let key = super::openai_prompt_cache_key("user-1", "gpt-5.5", Some(&session));
-
-        assert_eq!(
-            key,
-            "aura:v1:org:org-789:project:project_456:agent:agent_123:model:gpt-5.5"
-        );
-        assert!(!key.contains("session-ignored"));
-    }
-
-    #[test]
-    fn openai_prompt_cache_key_falls_back_to_user_scope() {
-        let key = super::openai_prompt_cache_key("user@example.com", "gpt-5.5", None);
-
-        assert_eq!(key, "aura:v1:user:user@example.com:model:gpt-5.5");
-    }
-
-    #[test]
-    fn openai_provider_request_controls_add_prompt_cache_key() {
+    fn openai_provider_request_controls_forward_threaded_cache_key() {
         let session = aura_router_proxy::storage::SessionContext {
             session_id: Some("session-ignored".to_string()),
             project_agent_id: Some("agent-a".to_string()),
             project_id: Some("project-a".to_string()),
             org_id: Some("org-a".to_string()),
+            prompt_cache_key: Some("instance:abc-123".to_string()),
         };
         let mut upstream = json!({
             "model": "gpt-5.5",
@@ -864,16 +791,52 @@ mod tests {
         super::apply_provider_request_controls(
             aura_router_proxy::providers::Provider::OpenAi,
             &mut upstream,
-            "user-a",
-            "gpt-5.5",
             Some(&session),
         );
 
-        assert_eq!(
-            upstream["prompt_cache_key"],
-            "aura:v1:org:org-a:project:project-a:agent:agent-a:model:gpt-5.5"
-        );
+        // The router forwards the harness-supplied key verbatim and never
+        // synthesizes its own org/project/agent/model key.
+        assert_eq!(upstream["prompt_cache_key"], "instance:abc-123");
         assert!(upstream.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn openai_provider_request_controls_skip_when_no_threaded_key() {
+        let session = aura_router_proxy::storage::SessionContext {
+            session_id: Some("sess".to_string()),
+            project_agent_id: Some("agent-a".to_string()),
+            project_id: Some("project-a".to_string()),
+            org_id: Some("org-a".to_string()),
+            prompt_cache_key: None,
+        };
+        let mut upstream = json!({ "model": "gpt-5.5", "messages": [] });
+
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::OpenAi,
+            &mut upstream,
+            Some(&session),
+        );
+
+        // No threaded key means no prompt caching (and crucially, no
+        // router-built oversized key that OpenAI would reject).
+        assert!(upstream.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn provider_request_controls_skip_non_openai() {
+        let session = aura_router_proxy::storage::SessionContext {
+            prompt_cache_key: Some("instance:abc-123".to_string()),
+            ..Default::default()
+        };
+        let mut upstream = json!({ "model": "claude", "messages": [] });
+
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::Anthropic,
+            &mut upstream,
+            Some(&session),
+        );
+
+        assert!(upstream.get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]

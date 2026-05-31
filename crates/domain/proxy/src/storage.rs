@@ -19,6 +19,12 @@ pub struct SessionContext {
     pub project_agent_id: Option<String>,
     pub project_id: Option<String>,
     pub org_id: Option<String>,
+    /// Caller-supplied OpenAI `prompt_cache_key`, threaded verbatim from
+    /// the harness via `X-Aura-Prompt-Cache-Key`. The harness owns key
+    /// derivation and length-clamping (OpenAI rejects keys longer than
+    /// 64 chars); the router forwards this value as-is and never
+    /// synthesizes its own.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl SessionContext {
@@ -43,11 +49,13 @@ impl SessionContext {
         let project_agent_id = read("x-aura-agent-id");
         let project_id = read("x-aura-project-id");
         let org_id = read("x-aura-org-id");
+        let prompt_cache_key = read("x-aura-prompt-cache-key");
 
         if session_id.is_none()
             && project_agent_id.is_none()
             && project_id.is_none()
             && org_id.is_none()
+            && prompt_cache_key.is_none()
         {
             return None;
         }
@@ -57,6 +65,7 @@ impl SessionContext {
             project_agent_id,
             project_id,
             org_id,
+            prompt_cache_key,
         })
     }
 }
@@ -283,6 +292,15 @@ mod tests {
         assert_eq!(ctx.org_id.as_deref(), Some("org-1"));
     }
 
+    #[test]
+    fn from_headers_threads_prompt_cache_key() {
+        let h = header_map(&[("x-aura-prompt-cache-key", "instance:abc-123")]);
+        let ctx =
+            SessionContext::from_headers(&h).expect("cache key alone should yield Some");
+        assert_eq!(ctx.prompt_cache_key.as_deref(), Some("instance:abc-123"));
+        assert!(ctx.session_id.is_none());
+    }
+
     #[tokio::test]
     async fn store_events_returns_early_without_session_id() {
         // Events are session-scoped; a context without session_id must
@@ -295,6 +313,7 @@ mod tests {
             project_agent_id: Some("agent-1".into()),
             project_id: Some("proj-1".into()),
             org_id: None,
+            prompt_cache_key: None,
         };
         store_events(
             &client,
