@@ -252,6 +252,27 @@ fn fireworks_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 60.0,
             input_tokens_is_new_only: false,
         }),
+        // DeepSeek V4 models are served via Fireworks, so they bill under the
+        // "fireworks" provider. Base rates match DeepSeek's published pricing;
+        // the standard markup is applied by `cache_aware_cost_cents`.
+        "aura-deepseek-v4-pro" | "accounts/fireworks/models/deepseek-v4-pro" => {
+            Some(CacheAwareRates {
+                new_input_cents_per_million: 174.0,
+                cache_write_input_cents_per_million: 174.0,
+                cache_read_input_cents_per_million: 14.5,
+                output_cents_per_million: 348.0,
+                input_tokens_is_new_only: false,
+            })
+        }
+        "aura-deepseek-v4-flash" | "accounts/fireworks/models/deepseek-v4-flash" => {
+            Some(CacheAwareRates {
+                new_input_cents_per_million: 14.0,
+                cache_write_input_cents_per_million: 14.0,
+                cache_read_input_cents_per_million: 2.8,
+                output_cents_per_million: 28.0,
+                input_tokens_is_new_only: false,
+            })
+        }
         _ => None,
     }
 }
@@ -603,6 +624,41 @@ mod tests {
         assert_eq!(
             cache_aware_cost_cents("openai", "aura-gpt-5-5", 10_000, 500, 10_000, 0),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn deepseek_via_fireworks_matches_direct_deepseek_cost() {
+        // DeepSeek now bills under the "fireworks" provider; the cost must be
+        // identical to the prior "deepseek"-provider result so the routing
+        // change does not alter what users pay.
+        for model in ["aura-deepseek-v4-pro", "aura-deepseek-v4-flash"] {
+            let via_fireworks =
+                cache_aware_cost_cents("fireworks", model, 1_000_000, 500_000, 0, 1_000_000);
+            let via_deepseek =
+                cache_aware_cost_cents("deepseek", model, 1_000_000, 500_000, 0, 1_000_000);
+            assert_eq!(via_fireworks, via_deepseek, "cost parity for {model}");
+            assert!(via_fireworks.is_some(), "rate present for {model}");
+        }
+
+        // The Fireworks upstream id resolves to the same rate as the aura id.
+        assert_eq!(
+            cache_aware_cost_cents(
+                "fireworks",
+                "accounts/fireworks/models/deepseek-v4-pro",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000,
+            ),
+            cache_aware_cost_cents(
+                "fireworks",
+                "aura-deepseek-v4-pro",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000,
+            ),
         );
     }
 

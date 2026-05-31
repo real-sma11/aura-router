@@ -93,25 +93,29 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "o4-mini",
             provider: Provider::OpenAi,
         }),
+        // DeepSeek V4 models are served via Fireworks (which hosts them
+        // verbatim) rather than DeepSeek's first-party API, so they reuse the
+        // already-provisioned FIREWORKS_API_KEY. Provider::DeepSeek remains for
+        // raw first-party passthrough names (see infer_provider).
         "aura-deepseek-v4-pro" => Some(ResolvedModel {
             requested_model: model,
-            upstream_model: "deepseek-v4-pro",
-            provider: Provider::DeepSeek,
+            upstream_model: "accounts/fireworks/models/deepseek-v4-pro",
+            provider: Provider::Fireworks,
         }),
         "aura-deepseek-v4-flash" => Some(ResolvedModel {
             requested_model: model,
-            upstream_model: "deepseek-v4-flash",
-            provider: Provider::DeepSeek,
+            upstream_model: "accounts/fireworks/models/deepseek-v4-flash",
+            provider: Provider::Fireworks,
         }),
         "deepseek/deepseek-v4-pro" => Some(ResolvedModel {
             requested_model: model,
-            upstream_model: "deepseek-v4-pro",
-            provider: Provider::DeepSeek,
+            upstream_model: "accounts/fireworks/models/deepseek-v4-pro",
+            provider: Provider::Fireworks,
         }),
         "deepseek/deepseek-v4-flash" => Some(ResolvedModel {
             requested_model: model,
-            upstream_model: "deepseek-v4-flash",
-            provider: Provider::DeepSeek,
+            upstream_model: "accounts/fireworks/models/deepseek-v4-flash",
+            provider: Provider::Fireworks,
         }),
         "aura-kimi-k2-5" => Some(ResolvedModel {
             requested_model: model,
@@ -264,6 +268,9 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "accounts/fireworks/models/kimi-k2p6" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
+        // DeepSeek V4 via Fireworks
+        "accounts/fireworks/models/deepseek-v4-pro"
+        | "accounts/fireworks/models/deepseek-v4-flash" => 1_000_000,
         // DeepSeek V4 direct API
         "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
             1_000_000
@@ -393,20 +400,29 @@ mod tests {
         );
         assert_eq!(
             resolve_provider("aura-deepseek-v4-flash"),
-            Some(Provider::DeepSeek)
+            Some(Provider::Fireworks)
         );
     }
 
     #[test]
-    fn resolves_deepseek_v4_models_to_direct_api() {
+    fn resolves_deepseek_v4_models_via_fireworks() {
+        // Picker-facing DeepSeek aliases route through Fireworks (which hosts
+        // the V4 models verbatim) and reuse FIREWORKS_API_KEY.
         let resolved = resolve_model("aura-deepseek-v4-pro").expect("aura alias");
-        assert_eq!(resolved.upstream_model, "deepseek-v4-pro");
-        assert_eq!(resolved.provider, Provider::DeepSeek);
+        assert_eq!(
+            resolved.upstream_model,
+            "accounts/fireworks/models/deepseek-v4-pro"
+        );
+        assert_eq!(resolved.provider, Provider::Fireworks);
 
         let resolved = resolve_model("deepseek/deepseek-v4-flash").expect("provider alias");
-        assert_eq!(resolved.upstream_model, "deepseek-v4-flash");
-        assert_eq!(resolved.provider, Provider::DeepSeek);
+        assert_eq!(
+            resolved.upstream_model,
+            "accounts/fireworks/models/deepseek-v4-flash"
+        );
+        assert_eq!(resolved.provider, Provider::Fireworks);
 
+        // Raw first-party names still resolve to the direct DeepSeek API.
         let resolved = resolve_model("deepseek-chat").expect("compat alias");
         assert_eq!(resolved.upstream_model, "deepseek-chat");
         assert_eq!(resolved.provider, Provider::DeepSeek);
