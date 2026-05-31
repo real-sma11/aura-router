@@ -26,6 +26,55 @@ impl Provider {
     }
 }
 
+/// The company that *makes* a model (its research lab / vendor), as shown
+/// to users in the model picker.
+///
+/// Deliberately distinct from [`Provider`], which identifies the upstream
+/// host we actually call: e.g. DeepSeek, Qwen, MiniMax and GLM are all
+/// served via `Provider::Fireworks` yet are made by four different
+/// companies.
+///
+/// The display strings returned by [`Maker::display_name`] are the
+/// canonical company labels and MUST stay in sync with aura-os
+/// `MODEL_VENDOR_LABELS` (`interface/src/constants/models.ts`) and the
+/// z-billing `Maker` enum. These three repos share no code, so the set is
+/// duplicated and kept aligned by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maker {
+    /// Anthropic (Claude).
+    Anthropic,
+    /// OpenAI (GPT, o-series, GPT-OSS).
+    OpenAi,
+    /// Google (Gemini, Gemma).
+    Google,
+    /// DeepSeek AI.
+    DeepSeek,
+    /// Moonshot AI (Kimi).
+    Moonshot,
+    /// MiniMax.
+    MiniMax,
+    /// Z.ai / Zhipu AI (GLM).
+    Zai,
+    /// Alibaba Cloud (Qwen / Tongyi).
+    Alibaba,
+}
+
+impl Maker {
+    /// Human-facing company name shown in the model picker.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Maker::Anthropic => "Anthropic",
+            Maker::OpenAi => "OpenAI",
+            Maker::Google => "Google",
+            Maker::DeepSeek => "DeepSeek AI",
+            Maker::Moonshot => "Moonshot AI",
+            Maker::MiniMax => "MiniMax",
+            Maker::Zai => "Z.ai",
+            Maker::Alibaba => "Alibaba Cloud",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModel<'a> {
     pub requested_model: &'a str,
@@ -248,6 +297,48 @@ pub fn resolve_provider(model: &str) -> Option<Provider> {
     resolve_model(model).map(|resolved| resolved.provider)
 }
 
+/// Resolve a model name to the company that makes it.
+///
+/// Resolves through [`resolve_model`] first so both Aura aliases
+/// (`aura-…`) and raw upstream names map correctly — including
+/// Fireworks-hosted `accounts/<org>/models/<name>` paths, whose host
+/// (`Provider::Fireworks`) says nothing about who built the model.
+/// Returns `None` for unrecognized models.
+pub fn model_maker(model: &str) -> Option<Maker> {
+    let upstream = resolve_model(model)
+        .map(|resolved| resolved.upstream_model)
+        .unwrap_or(model);
+    // Reduce Fireworks-style "accounts/<org>/models/<name>" paths to the
+    // bare model name so the checks below match on the model, not the host.
+    let name = upstream.rsplit('/').next().unwrap_or(upstream);
+    let maker = if name.contains("claude") {
+        Maker::Anthropic
+    } else if name.starts_with("gpt")
+        || name.starts_with("o1")
+        || name.starts_with("o3")
+        || name.starts_with("o4")
+        || name.starts_with("codex")
+        || name.contains("oss")
+    {
+        Maker::OpenAi
+    } else if name.contains("gemini") || name.contains("gemma") {
+        Maker::Google
+    } else if name.contains("deepseek") {
+        Maker::DeepSeek
+    } else if name.contains("kimi") {
+        Maker::Moonshot
+    } else if name.contains("minimax") {
+        Maker::MiniMax
+    } else if name.contains("glm") {
+        Maker::Zai
+    } else if name.contains("qwen") {
+        Maker::Alibaba
+    } else {
+        return None;
+    };
+    Some(maker)
+}
+
 /// Which OpenAI HTTP surface a request should use.
 ///
 /// OpenAI's `/v1/chat/completions` rejects requests that combine function
@@ -412,8 +503,8 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
 #[cfg(test)]
 mod tests {
     use super::{
-        openai_api_for_request, openai_endpoint_url, resolve_model, resolve_provider, OpenAiApi,
-        Provider,
+        model_maker, openai_api_for_request, openai_endpoint_url, resolve_model, resolve_provider,
+        OpenAiApi, Provider,
     };
     use serde_json::json;
 
@@ -483,6 +574,33 @@ mod tests {
         assert_eq!(resolved.requested_model, "claude-sonnet-4-6");
         assert_eq!(resolved.upstream_model, "claude-sonnet-4-6");
         assert_eq!(resolved.provider, Provider::Anthropic);
+    }
+
+    #[test]
+    fn model_maker_attributes_models_to_their_company_not_their_host() {
+        // Fireworks-hosted models still resolve to their real maker, even
+        // though their host provider is Fireworks.
+        let cases = [
+            ("aura-claude-opus-4-8", "Anthropic"),
+            ("aura-gpt-5-5", "OpenAI"),
+            ("aura-oss-120b", "OpenAI"),
+            ("aura-gemini-3-1-pro", "Google"),
+            ("aura-gemma-4-31b", "Google"),
+            ("aura-deepseek-v4-pro", "DeepSeek AI"),
+            ("deepseek/deepseek-v4-flash", "DeepSeek AI"),
+            ("aura-kimi-k2-6", "Moonshot AI"),
+            ("aura-minimax-m2-7", "MiniMax"),
+            ("aura-glm-5-1", "Z.ai"),
+            ("aura-qwen3-6-plus", "Alibaba Cloud"),
+        ];
+        for (model, expected) in cases {
+            assert_eq!(
+                model_maker(model).map(|m| m.display_name()),
+                Some(expected),
+                "maker for {model}"
+            );
+        }
+        assert_eq!(model_maker("totally-unknown-model"), None);
     }
 
     #[test]
