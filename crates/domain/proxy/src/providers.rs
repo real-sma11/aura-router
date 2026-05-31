@@ -137,6 +137,31 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/qwen2p5-coder-7b",
             provider: Provider::Fireworks,
         }),
+        "aura-minimax-m2-7" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/minimax-m2p7",
+            provider: Provider::Fireworks,
+        }),
+        "aura-glm-5-1" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/glm-5p1",
+            provider: Provider::Fireworks,
+        }),
+        "aura-qwen3-6-plus" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/qwen3p6-plus",
+            provider: Provider::Fireworks,
+        }),
+        "aura-gemma-4-31b" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/gemma-4-31b-it",
+            provider: Provider::Fireworks,
+        }),
+        "aura-gemma-4-26b-a4b" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/gemma-4-26b-a4b-it",
+            provider: Provider::Fireworks,
+        }),
         _ => None,
     }
 }
@@ -268,6 +293,11 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "accounts/fireworks/models/kimi-k2p6" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
+        "accounts/fireworks/models/minimax-m2p7" => 196_608,
+        "accounts/fireworks/models/glm-5p1" => 202_752,
+        "accounts/fireworks/models/qwen3p6-plus" => 262_144,
+        "accounts/fireworks/models/gemma-4-31b-it" => 262_144,
+        "accounts/fireworks/models/gemma-4-26b-a4b-it" => 262_144,
         // DeepSeek V4 via Fireworks
         "accounts/fireworks/models/deepseek-v4-pro"
         | "accounts/fireworks/models/deepseek-v4-flash" => 1_000_000,
@@ -436,6 +466,24 @@ mod tests {
             "accounts/fireworks/models/kimi-k2p6"
         );
         assert_eq!(resolved.provider, Provider::Fireworks);
+    }
+
+    #[test]
+    fn resolves_new_fireworks_models() {
+        for (alias, upstream) in [
+            ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
+            ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
+            ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
+            ("aura-gemma-4-31b", "accounts/fireworks/models/gemma-4-31b-it"),
+            (
+                "aura-gemma-4-26b-a4b",
+                "accounts/fireworks/models/gemma-4-26b-a4b-it",
+            ),
+        ] {
+            let resolved = resolve_model(alias).expect("aura alias should resolve");
+            assert_eq!(resolved.upstream_model, upstream);
+            assert_eq!(resolved.provider, Provider::Fireworks);
+        }
     }
 
     #[test]
