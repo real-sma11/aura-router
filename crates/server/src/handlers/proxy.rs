@@ -72,6 +72,11 @@ pub async fn messages(
     let provider = resolved_model.provider;
     anthropic_compat::validate_request(provider, &request_value).map_err(AppError::BadRequest)?;
 
+    // OpenAI rejects function tools + reasoning_effort on /v1/chat/completions
+    // for the gpt-5 family; route any tool-bearing OpenAI request through the
+    // /v1/responses API instead (which supports tools + reasoning together).
+    let openai_api = providers::openai_api_for_request(provider, &request_value);
+
     // Public-guest requests (from the logged-out aura.ai surface) skip
     // billing entirely — cost is capped by the upstream rate limiter in
     // aura-os-server (3 turns/guest, 30/IP/day, global daily ceiling).
@@ -124,15 +129,25 @@ pub async fn messages(
     };
 
     // Forward to provider
-    let upstream_url = providers::provider_url(&resolved_model.provider);
+    let upstream_url = match provider {
+        providers::Provider::OpenAi => providers::openai_endpoint_url(openai_api),
+        other => providers::provider_url(&other),
+    };
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
-    let mut upstream_request_value = anthropic_compat::request_to_upstream(
-        provider,
-        resolved_model.upstream_model,
-        &request_value,
-    )
-    .map_err(AppError::BadRequest)?;
+    let mut upstream_request_value = match openai_api {
+        providers::OpenAiApi::Responses => anthropic_compat::anthropic_request_to_openai_responses(
+            &request_value,
+            resolved_model.upstream_model,
+        )
+        .map_err(AppError::BadRequest)?,
+        providers::OpenAiApi::ChatCompletions => anthropic_compat::request_to_upstream(
+            provider,
+            resolved_model.upstream_model,
+            &request_value,
+        )
+        .map_err(AppError::BadRequest)?,
+    };
     apply_provider_request_controls(
         provider,
         &mut upstream_request_value,
@@ -169,6 +184,7 @@ pub async fn messages(
             state,
             requested_model,
             provider,
+            openai_api,
             provider_name,
             upstream_resp,
             session_ctx,
@@ -183,6 +199,7 @@ pub async fn messages(
         state,
         requested_model,
         provider_name,
+        openai_api,
         upstream_resp,
         session_ctx,
         user_content,
@@ -197,6 +214,7 @@ async fn handle_non_streaming(
     state: AppState,
     model: &str,
     provider_name: &str,
+    openai_api: providers::OpenAiApi,
     upstream_resp: reqwest::Response,
     session_ctx: Option<storage::SessionContext>,
     user_content: String,
@@ -209,12 +227,18 @@ async fn handle_non_streaming(
 
     let upstream_value: serde_json::Value = serde_json::from_slice(&response_bytes)
         .map_err(|e| AppError::ProviderError(format!("Provider returned invalid JSON: {e}")))?;
-    let response_value = anthropic_compat::response_from_upstream(
-        provider_from_name(provider_name),
-        model,
-        &upstream_value,
-    )
-    .map_err(AppError::ProviderError)?;
+    let response_value = match openai_api {
+        providers::OpenAiApi::Responses => {
+            anthropic_compat::openai_responses_to_anthropic(&upstream_value, model)
+                .map_err(AppError::ProviderError)?
+        }
+        providers::OpenAiApi::ChatCompletions => anthropic_compat::response_from_upstream(
+            provider_from_name(provider_name),
+            model,
+            &upstream_value,
+        )
+        .map_err(AppError::ProviderError)?,
+    };
     let normalized_response_bytes = serde_json::to_vec(&response_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode normalized response: {e}")))?;
 
@@ -238,7 +262,9 @@ async fn handle_non_streaming(
 
     let org_id_ref = session_ctx.as_ref().and_then(|c| c.org_id.as_deref());
     let project_id_ref = session_ctx.as_ref().and_then(|c| c.project_id.as_deref());
-    let agent_id_ref = session_ctx.as_ref().and_then(|c| c.project_agent_id.as_deref());
+    let agent_id_ref = session_ctx
+        .as_ref()
+        .and_then(|c| c.project_agent_id.as_deref());
 
     let duration_ms = request_start.elapsed().as_millis() as u64;
 
@@ -317,6 +343,7 @@ async fn handle_streaming(
     state: AppState,
     model: &str,
     provider: providers::Provider,
+    openai_api: providers::OpenAiApi,
     provider_name: &str,
     upstream_resp: reqwest::Response,
     session_ctx: Option<storage::SessionContext>,
@@ -325,14 +352,16 @@ async fn handle_streaming(
 ) -> Result<Response, AppError> {
     let model_owned = model.to_string();
     let provider_owned = provider_name.to_string();
-    let (tee_stream, usage_rx) = stream::proxy_stream(provider, model, upstream_resp);
+    let (tee_stream, usage_rx) = stream::proxy_stream(provider, openai_api, model, upstream_resp);
 
     // Spawn task to handle billing + storage after stream completes
     let billing_state = state.clone();
     let user_id = auth.user_id.clone();
     let stream_org_id = session_ctx.as_ref().and_then(|c| c.org_id.clone());
     let stream_project_id = session_ctx.as_ref().and_then(|c| c.project_id.clone());
-    let stream_agent_id = session_ctx.as_ref().and_then(|c| c.project_agent_id.clone());
+    let stream_agent_id = session_ctx
+        .as_ref()
+        .and_then(|c| c.project_agent_id.clone());
     tokio::spawn(async move {
         if let Ok(usage) = usage_rx.await {
             let duration_ms = request_start.elapsed().as_millis() as u64;
@@ -450,9 +479,7 @@ fn openai_prompt_cache_key(
             format!(
                 "aura:v1:{principal}:project:{}:agent:{}:model:{model}",
                 sanitize_cache_key_component(ctx.project_id.as_deref().unwrap_or("none")),
-                sanitize_cache_key_component(
-                    ctx.project_agent_id.as_deref().unwrap_or("none"),
-                ),
+                sanitize_cache_key_component(ctx.project_agent_id.as_deref().unwrap_or("none"),),
             )
         }
         None => format!(

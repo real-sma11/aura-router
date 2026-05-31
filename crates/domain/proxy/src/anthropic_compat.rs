@@ -56,13 +56,7 @@ fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Va
         return;
     };
     let mapped = match provider {
-        Provider::OpenAi => match tier.trim().to_ascii_lowercase().as_str() {
-            "minimal" => Some("minimal"),
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" | "xhigh" | "max" => Some("high"),
-            _ => None,
-        },
+        Provider::OpenAi => openai_reasoning_effort(tier),
         Provider::Fireworks => match tier.trim().to_ascii_lowercase().as_str() {
             "minimal" | "low" => Some("low"),
             "medium" => Some("medium"),
@@ -77,6 +71,321 @@ fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Va
             Value::String(effort.to_string()),
         );
     }
+}
+
+/// Clamp the provider-neutral effort tier to the values OpenAI accepts.
+/// OpenAI exposes `minimal`/`low`/`medium`/`high`; the larger Anthropic
+/// tiers (`xhigh`/`max`) fold to `high`. Shared by the chat/completions
+/// (`reasoning_effort`) and Responses (`reasoning.effort`) paths.
+fn openai_reasoning_effort(tier: &str) -> Option<&'static str> {
+    match tier.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
+    }
+}
+
+/// Translate an inbound Anthropic `/v1/messages` request into an OpenAI
+/// **Responses API** (`/v1/responses`) request body.
+///
+/// Used for OpenAI requests that carry function tools: chat/completions
+/// rejects `tools` + `reasoning_effort` for the gpt-5 family, and the
+/// Responses API is OpenAI's go-forward tool-use surface. The conversation
+/// is replayed as `input` items (`message` + `function_call` +
+/// `function_call_output`), tools use the flat Responses function shape,
+/// and effort is carried as `reasoning.effort` (only when the request
+/// actually requested an effort tier, so non-reasoning models such as
+/// gpt-4.1 are not handed an invalid `reasoning` param).
+pub fn anthropic_request_to_openai_responses(
+    request: &Value,
+    upstream_model: &str,
+) -> Result<Value, String> {
+    let request_messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Anthropic request is missing messages array".to_string())?;
+
+    let mut input: Vec<Value> = Vec::new();
+    for message in request_messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Anthropic message is missing role".to_string())?;
+        let blocks = message_content_blocks(message.get("content"))?;
+        match role {
+            "user" => append_responses_user_items(&blocks, &mut input),
+            "assistant" => append_responses_assistant_items(&blocks, &mut input),
+            other => return Err(format!("Unsupported Anthropic role `{other}`")),
+        }
+    }
+
+    // The Responses API retains conversation state server-side by default
+    // (`store: true`). Force the stateless path to match the privacy
+    // posture of the chat/completions lane.
+    let mut upstream = json!({
+        "model": upstream_model,
+        "input": input,
+        "store": false,
+    });
+
+    if let Some(system) = request.get("system") {
+        let system_text = flatten_text_blocks(system);
+        if !system_text.is_empty() {
+            upstream["instructions"] = Value::String(system_text);
+        }
+    }
+
+    if let Some(max_tokens) = request.get("max_tokens").and_then(Value::as_u64) {
+        upstream["max_output_tokens"] = Value::from(max_tokens);
+    }
+
+    // Deliberately omit temperature/top_p: gpt-5 and o-series reasoning
+    // models reject them on the Responses API.
+
+    let is_streaming = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_streaming {
+        upstream["stream"] = Value::Bool(true);
+    }
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        if !tools.is_empty() {
+            upstream["tools"] = Value::Array(
+                tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                            "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    if let Some(tool_choice) = request.get("tool_choice").and_then(Value::as_object) {
+        let mapped = match tool_choice.get("type").and_then(Value::as_str) {
+            Some("auto") => Some(Value::String("auto".to_string())),
+            Some("any") => Some(Value::String("required".to_string())),
+            Some("none") => Some(Value::String("none".to_string())),
+            Some("tool") => tool_choice.get("name").and_then(Value::as_str).map(|name| {
+                json!({
+                    "type": "function",
+                    "name": name,
+                })
+            }),
+            _ => None,
+        };
+        if let Some(value) = mapped {
+            upstream["tool_choice"] = value;
+        }
+    }
+
+    if let Some(tier) = request.get("reasoning_effort").and_then(Value::as_str) {
+        if let Some(effort) = openai_reasoning_effort(tier) {
+            upstream["reasoning"] = json!({ "effort": effort });
+        }
+    }
+
+    Ok(upstream)
+}
+
+fn append_responses_user_items(blocks: &[Value], input: &mut Vec<Value>) {
+    let mut content_parts: Vec<Value> = Vec::new();
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                content_parts.push(json!({ "type": "input_text", "text": text }));
+            }
+            Some("image") => {
+                let source = block.get("source").unwrap_or(&Value::Null);
+                let media_type = source
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                let data = source
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                content_parts.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                }));
+            }
+            Some("tool_result") => {
+                // Flush any accumulated user content first so item ordering
+                // matches the original message (tool outputs interleaved with
+                // text stay in sequence).
+                if !content_parts.is_empty() {
+                    input.push(json!({
+                        "role": "user",
+                        "content": std::mem::take(&mut content_parts),
+                    }));
+                }
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                    "output": stringify_tool_result_content(block.get("content")),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if !content_parts.is_empty() {
+        input.push(json!({
+            "role": "user",
+            "content": content_parts,
+        }));
+    }
+}
+
+fn append_responses_assistant_items(blocks: &[Value], input: &mut Vec<Value>) {
+    let mut text_parts: Vec<String> = Vec::new();
+
+    let flush_text = |text_parts: &mut Vec<String>, input: &mut Vec<Value>| {
+        if !text_parts.is_empty() {
+            input.push(json!({
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": std::mem::take(text_parts).join("\n\n"),
+                }],
+            }));
+        }
+    };
+
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            Some("tool_use") => {
+                flush_text(&mut text_parts, input);
+                let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "arguments": arguments.to_string(),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    flush_text(&mut text_parts, input);
+}
+
+/// Translate a non-streaming OpenAI Responses API response into the
+/// Anthropic `/v1/messages` response shape.
+pub fn openai_responses_to_anthropic(
+    response: &Value,
+    requested_model: &str,
+) -> Result<Value, String> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "OpenAI Responses response is missing output".to_string())?;
+
+    let mut content = Vec::new();
+    let mut saw_function_call = false;
+
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let text = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|part| {
+                                part.get("type").and_then(Value::as_str) == Some("output_text")
+                            })
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            Some("function_call") => {
+                saw_function_call = true;
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let parsed_input = serde_json::from_str::<Value>(arguments)
+                    .unwrap_or_else(|_| Value::String(arguments.to_string()));
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or_default(),
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "input": parsed_input,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let stop_reason = if saw_function_call {
+        "tool_use"
+    } else if response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+        == Some("max_output_tokens")
+    {
+        "max_tokens"
+    } else {
+        "end_turn"
+    };
+
+    let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read_input_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+
+    Ok(json!({
+        "id": response.get("id").and_then(Value::as_str).unwrap_or_default(),
+        "model": requested_model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": Value::Null,
+            "cache_read_input_tokens": cache_read_input_tokens,
+        }
+    }))
 }
 
 pub fn response_from_upstream(
@@ -679,7 +988,8 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_last_user_text, extract_response_text, request_to_upstream, response_from_upstream,
+        anthropic_request_to_openai_responses, extract_last_user_text, extract_response_text,
+        openai_responses_to_anthropic, request_to_upstream, response_from_upstream,
         validate_request,
     };
     use crate::providers::Provider;
@@ -751,6 +1061,155 @@ mod tests {
             upstream["output_config"]["effort"],
             Value::String("high".to_string())
         );
+    }
+
+    #[test]
+    fn responses_request_replays_conversation_as_input_items() {
+        let request = json!({
+            "model": "aura-gpt-5-5",
+            "system": [{"type": "text", "text": "Be helpful"}],
+            "max_tokens": 2048,
+            "reasoning_effort": "high",
+            "tool_choice": {"type": "auto"},
+            "tools": [{
+                "name": "search_repo",
+                "description": "Search repos",
+                "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}
+            }],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Find a repo"}]},
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "search_repo",
+                        "input": {"query": "aura"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "found it"
+                    }]
+                }
+            ]
+        });
+
+        let upstream = anthropic_request_to_openai_responses(&request, "gpt-5.5")
+            .expect("responses translation");
+
+        assert_eq!(upstream["model"], "gpt-5.5");
+        assert_eq!(upstream["store"], Value::Bool(false));
+        assert_eq!(upstream["instructions"], "Be helpful");
+        assert_eq!(upstream["max_output_tokens"], 2048);
+        assert_eq!(upstream["reasoning"]["effort"], "high");
+        assert_eq!(upstream["tool_choice"], "auto");
+
+        // Tools use the flat Responses function shape.
+        assert_eq!(upstream["tools"][0]["type"], "function");
+        assert_eq!(upstream["tools"][0]["name"], "search_repo");
+        assert!(upstream["tools"][0]["parameters"].is_object());
+
+        let input = upstream["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3, "input items: {input:?}");
+
+        // user text message
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "Find a repo");
+
+        // assistant function_call (arguments stringified)
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "toolu_1");
+        assert_eq!(input[1]["name"], "search_repo");
+        assert_eq!(input[1]["arguments"], "{\"query\":\"aura\"}");
+
+        // function_call_output referencing the same call_id
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "toolu_1");
+        assert_eq!(input[2]["output"], "found it");
+    }
+
+    #[test]
+    fn responses_request_omits_reasoning_without_effort() {
+        let request = json!({
+            "model": "aura-gpt-4.1",
+            "max_tokens": 512,
+            "tools": [{"name": "noop", "input_schema": {}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let upstream =
+            anthropic_request_to_openai_responses(&request, "gpt-4.1").expect("translation");
+        assert!(
+            upstream.get("reasoning").is_none(),
+            "non-reasoning model with tools must not receive a reasoning param: {upstream}"
+        );
+    }
+
+    #[test]
+    fn responses_response_maps_text_and_tool_calls() {
+        let response = json!({
+            "id": "resp_123",
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Here you go"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "search_repo",
+                    "arguments": "{\"query\":\"aura\"}"
+                }
+            ],
+            "usage": {
+                "input_tokens": 42,
+                "output_tokens": 7,
+                "input_tokens_details": {"cached_tokens": 12}
+            }
+        });
+
+        let normalized =
+            openai_responses_to_anthropic(&response, "aura-gpt-5-5").expect("normalize");
+
+        assert_eq!(normalized["id"], "resp_123");
+        assert_eq!(normalized["model"], "aura-gpt-5-5");
+        assert_eq!(normalized["stop_reason"], "tool_use");
+        assert_eq!(normalized["content"][0]["type"], "text");
+        assert_eq!(normalized["content"][0]["text"], "Here you go");
+        assert_eq!(normalized["content"][1]["type"], "tool_use");
+        assert_eq!(normalized["content"][1]["id"], "call_1");
+        assert_eq!(normalized["content"][1]["name"], "search_repo");
+        assert_eq!(normalized["content"][1]["input"]["query"], "aura");
+        assert_eq!(normalized["usage"]["input_tokens"], 42);
+        assert_eq!(normalized["usage"]["output_tokens"], 7);
+        assert_eq!(normalized["usage"]["cache_read_input_tokens"], 12);
+    }
+
+    #[test]
+    fn responses_response_maps_max_tokens_stop_reason() {
+        let response = json!({
+            "id": "resp_456",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "partial"}]
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let normalized = openai_responses_to_anthropic(&response, "gpt-5.5").expect("normalize");
+        assert_eq!(normalized["stop_reason"], "max_tokens");
     }
 
     #[test]

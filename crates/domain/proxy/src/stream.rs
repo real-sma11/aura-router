@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::providers::{self, Provider};
+use crate::providers::{self, OpenAiApi, Provider};
 
 /// Token usage extracted from an SSE stream.
 #[derive(Debug, Default)]
@@ -27,6 +27,7 @@ pub struct StreamUsage {
 /// capturing billing data along the way.
 pub fn proxy_stream(
     provider: Provider,
+    api: OpenAiApi,
     requested_model: &str,
     upstream: reqwest::Response,
 ) -> (
@@ -38,7 +39,7 @@ pub fn proxy_stream(
 
     let tee_stream = TeeStream {
         inner: Box::pin(byte_stream),
-        adapter: StreamAdapter::new(provider, requested_model),
+        adapter: StreamAdapter::new(provider, api, requested_model),
         usage_tx: Some(usage_tx),
         finished: false,
         pending_output: VecDeque::new(),
@@ -132,14 +133,18 @@ where
 enum StreamAdapter {
     Anthropic(AnthropicPassthrough),
     OpenAi(OpenAiCompatStream),
+    OpenAiResponses(OpenAiResponsesStream),
 }
 
 impl StreamAdapter {
-    fn new(provider: Provider, requested_model: &str) -> Self {
+    fn new(provider: Provider, api: OpenAiApi, requested_model: &str) -> Self {
         match provider {
             Provider::Anthropic => Self::Anthropic(AnthropicPassthrough {
                 parser: SseParser::new(),
             }),
+            Provider::OpenAi if api == OpenAiApi::Responses => {
+                Self::OpenAiResponses(OpenAiResponsesStream::new(requested_model))
+            }
             Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
                 Self::OpenAi(OpenAiCompatStream::new(requested_model))
             }
@@ -150,6 +155,7 @@ impl StreamAdapter {
         match self {
             Self::Anthropic(adapter) => adapter.feed(bytes, output),
             Self::OpenAi(adapter) => adapter.feed(bytes, output),
+            Self::OpenAiResponses(adapter) => adapter.feed(bytes, output),
         }
     }
 
@@ -157,6 +163,7 @@ impl StreamAdapter {
         match self {
             Self::Anthropic(adapter) => adapter.finish(output),
             Self::OpenAi(adapter) => adapter.finish(output),
+            Self::OpenAiResponses(adapter) => adapter.finish(output),
         }
     }
 }
@@ -566,6 +573,425 @@ impl OpenAiCompatStream {
     }
 }
 
+/// Translates an OpenAI **Responses API** (`/v1/responses`) SSE stream into
+/// Anthropic-style `/v1/messages` events.
+///
+/// The Responses stream is a sequence of typed events
+/// (`response.output_item.added`, `response.output_text.delta`,
+/// `response.function_call_arguments.delta`, `response.output_item.done`,
+/// `response.completed`, ...). We map them onto the same Anthropic content
+/// block lifecycle the chat-completions adapter emits, assigning a
+/// contiguous Anthropic `index` per emitted block (reasoning items are
+/// skipped, so they never occupy a client-visible index).
+struct OpenAiResponsesStream {
+    requested_model: String,
+    buffer: String,
+    usage: StreamUsage,
+    message_id: Option<String>,
+    message_started: bool,
+    blocks: BTreeMap<usize, ResponsesBlock>,
+    next_index: usize,
+    saw_tool_call: bool,
+    incomplete_max_tokens: bool,
+    finalized: bool,
+}
+
+#[derive(Default)]
+struct ResponsesBlock {
+    anthropic_index: usize,
+    is_tool: bool,
+    started: bool,
+    stopped: bool,
+    tool_id: String,
+    tool_name: String,
+    pending_args: String,
+}
+
+impl OpenAiResponsesStream {
+    fn new(requested_model: &str) -> Self {
+        Self {
+            requested_model: requested_model.to_string(),
+            buffer: String::new(),
+            usage: StreamUsage {
+                model: Some(requested_model.to_string()),
+                ..StreamUsage::default()
+            },
+            message_id: None,
+            message_started: false,
+            blocks: BTreeMap::new(),
+            next_index: 0,
+            saw_tool_call: false,
+            incomplete_max_tokens: false,
+            finalized: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: Bytes, output: &mut VecDeque<Bytes>) {
+        let text = String::from_utf8_lossy(&bytes);
+        self.buffer.push_str(&text);
+
+        while let Some((event, delimiter_len)) = next_sse_event(&self.buffer) {
+            let event_str = self.buffer[..event].to_string();
+            self.buffer = self.buffer[event + delimiter_len..].to_string();
+            self.process_event(&event_str, output);
+        }
+    }
+
+    fn finish(&mut self, output: &mut VecDeque<Bytes>) -> StreamUsage {
+        self.finish_message(output);
+        StreamUsage {
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            model: self.usage.model.clone(),
+        }
+    }
+
+    fn process_event(&mut self, event_str: &str, output: &mut VecDeque<Bytes>) {
+        // Responses streams carry both `event:` and `data:` lines; the data
+        // JSON repeats the event name in its `type` field, so we parse the
+        // JSON and branch on `type` (ignoring the `event:` line).
+        let mut data_lines = Vec::new();
+        for line in event_str.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_lines.push(data.to_string());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                data_lines.push(data.trim().to_string());
+            }
+        }
+        if data_lines.is_empty() {
+            return;
+        }
+        let data = data_lines.join("\n");
+        if data == "[DONE]" {
+            self.finish_message(output);
+            return;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.created") | Some("response.in_progress") => {
+                if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
+                    self.message_id.get_or_insert_with(|| id.to_string());
+                }
+                if let Some(model) = event.pointer("/response/model").and_then(Value::as_str) {
+                    self.usage.model = Some(model.to_string());
+                }
+            }
+            Some("response.output_item.added") => {
+                self.on_output_item_added(&event, output);
+            }
+            Some("response.output_text.delta") => {
+                self.on_output_text_delta(&event, output);
+            }
+            Some("response.function_call_arguments.delta") => {
+                self.on_function_args_delta(&event, output);
+            }
+            Some("response.output_item.done") => {
+                self.on_output_item_done(&event, output);
+            }
+            Some("response.completed") | Some("response.incomplete") => {
+                self.capture_response_usage(&event);
+                self.finish_message(output);
+            }
+            Some("response.failed") | Some("error") => {
+                let message = event
+                    .pointer("/response/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
+                    .or_else(|| event.get("message").and_then(Value::as_str))
+                    .unwrap_or("OpenAI Responses stream error");
+                output.push_back(anthropic_sse(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": { "message": message }
+                    }),
+                ));
+                self.finalized = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_output_item_added(&mut self, event: &Value, output: &mut VecDeque<Bytes>) {
+        let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
+            return;
+        };
+        let output_index = output_index as usize;
+        let item = event.get("item").unwrap_or(&Value::Null);
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                self.ensure_message_started(output);
+                self.saw_tool_call = true;
+                let anthropic_index = self.next_index;
+                self.next_index += 1;
+                let tool_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                let tool_name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut block = ResponsesBlock {
+                    anthropic_index,
+                    is_tool: true,
+                    tool_id,
+                    tool_name,
+                    ..ResponsesBlock::default()
+                };
+                if !block.tool_name.is_empty() {
+                    Self::emit_tool_start(&block, output);
+                    block.started = true;
+                }
+                self.blocks.insert(output_index, block);
+            }
+            // Text (`message`) and `reasoning` items defer: text blocks start
+            // on the first text delta; reasoning items are dropped.
+            _ => {}
+        }
+    }
+
+    fn on_output_text_delta(&mut self, event: &Value, output: &mut VecDeque<Bytes>) {
+        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
+            return;
+        };
+        let output_index = output_index as usize;
+        self.ensure_message_started(output);
+
+        if !self.blocks.contains_key(&output_index) {
+            let anthropic_index = self.next_index;
+            self.next_index += 1;
+            self.blocks.insert(
+                output_index,
+                ResponsesBlock {
+                    anthropic_index,
+                    is_tool: false,
+                    started: true,
+                    ..ResponsesBlock::default()
+                },
+            );
+            output.push_back(anthropic_sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": anthropic_index,
+                    "content_block": { "type": "text", "text": "" }
+                }),
+            ));
+        }
+
+        let index = self.blocks.get(&output_index).map(|b| b.anthropic_index);
+        if let Some(index) = index {
+            output.push_back(anthropic_sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": { "type": "text_delta", "text": delta }
+                }),
+            ));
+        }
+    }
+
+    fn on_function_args_delta(&mut self, event: &Value, output: &mut VecDeque<Bytes>) {
+        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
+            return;
+        };
+        let output_index = output_index as usize;
+        if let Some(block) = self.blocks.get_mut(&output_index) {
+            if block.started {
+                let index = block.anthropic_index;
+                output.push_back(anthropic_sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "input_json_delta", "partial_json": delta }
+                    }),
+                ));
+            } else {
+                block.pending_args.push_str(delta);
+            }
+        }
+    }
+
+    fn on_output_item_done(&mut self, event: &Value, output: &mut VecDeque<Bytes>) {
+        let Some(output_index) = event.get("output_index").and_then(Value::as_u64) else {
+            return;
+        };
+        let output_index = output_index as usize;
+        let item_name = event
+            .pointer("/item/name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(block) = self.blocks.get_mut(&output_index) else {
+            return;
+        };
+
+        // A tool block whose name only arrived on the `done` item: open it now
+        // and flush any buffered argument fragments before closing.
+        if block.is_tool && !block.started {
+            if let Some(name) = item_name {
+                if block.tool_name.is_empty() {
+                    block.tool_name = name;
+                }
+            }
+            Self::emit_tool_start(block, output);
+            block.started = true;
+            if !block.pending_args.is_empty() {
+                let index = block.anthropic_index;
+                let pending = std::mem::take(&mut block.pending_args);
+                output.push_back(anthropic_sse(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": { "type": "input_json_delta", "partial_json": pending }
+                    }),
+                ));
+            }
+        }
+
+        if block.started && !block.stopped {
+            let index = block.anthropic_index;
+            output.push_back(anthropic_sse(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": index }),
+            ));
+            block.stopped = true;
+        }
+    }
+
+    fn capture_response_usage(&mut self, event: &Value) {
+        if let Some(model) = event.pointer("/response/model").and_then(Value::as_str) {
+            self.usage.model = Some(model.to_string());
+        }
+        if let Some(usage) = event.pointer("/response/usage") {
+            self.usage.input_tokens = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.input_tokens);
+            self.usage.output_tokens = usage
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.output_tokens);
+            self.usage.cache_read_input_tokens = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.cache_read_input_tokens);
+        }
+        if event
+            .pointer("/response/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
+        {
+            self.incomplete_max_tokens = true;
+        }
+    }
+
+    fn emit_tool_start(block: &ResponsesBlock, output: &mut VecDeque<Bytes>) {
+        output.push_back(anthropic_sse(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": block.anthropic_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": block.tool_id,
+                    "name": block.tool_name,
+                    "input": {},
+                }
+            }),
+        ));
+    }
+
+    fn ensure_message_started(&mut self, output: &mut VecDeque<Bytes>) {
+        if self.message_started {
+            return;
+        }
+        self.message_started = true;
+        let message_id = self
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
+        output.push_back(anthropic_sse(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.requested_model,
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": { "input_tokens": self.usage.input_tokens }
+                }
+            }),
+        ));
+    }
+
+    fn finish_message(&mut self, output: &mut VecDeque<Bytes>) {
+        if self.finalized || !self.message_started {
+            return;
+        }
+
+        for block in self.blocks.values_mut() {
+            if block.started && !block.stopped {
+                output.push_back(anthropic_sse(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": block.anthropic_index }),
+                ));
+                block.stopped = true;
+            }
+        }
+
+        let stop_reason = if self.saw_tool_call {
+            "tool_use"
+        } else if self.incomplete_max_tokens {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
+
+        output.push_back(anthropic_sse(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": Value::Null,
+                },
+                "usage": { "output_tokens": self.usage.output_tokens }
+            }),
+        ));
+        output.push_back(anthropic_sse(
+            "message_stop",
+            json!({ "type": "message_stop" }),
+        ));
+        self.finalized = true;
+    }
+}
+
 /// Parses Anthropic SSE lines to extract billing-relevant data.
 struct SseParser {
     buffer: String,
@@ -706,7 +1132,11 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
             inner: Box::pin(stream),
-            adapter: StreamAdapter::new(Provider::Anthropic, "aura-claude-sonnet-4-6"),
+            adapter: StreamAdapter::new(
+                Provider::Anthropic,
+                OpenAiApi::ChatCompletions,
+                "aura-claude-sonnet-4-6",
+            ),
             usage_tx: Some(tx),
             finished: false,
             pending_output: VecDeque::new(),
@@ -725,6 +1155,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_responses_stream_translates_text_and_tool_calls() {
+        let stream = bytes_stream(vec![
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"delta\":\"Hello\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"search_repo\"}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\"}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"\\\"aura\\\"}\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"search_repo\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
+        ]);
+        let (tx, rx) = oneshot::channel();
+        let mut tee = TeeStream {
+            inner: Box::pin(stream),
+            adapter: StreamAdapter::new(Provider::OpenAi, OpenAiApi::Responses, "aura-gpt-5-5"),
+            usage_tx: Some(tx),
+            finished: false,
+            pending_output: VecDeque::new(),
+        };
+
+        let mut emitted = Vec::new();
+        while let Some(chunk) = tee.next().await {
+            emitted.push(String::from_utf8_lossy(&chunk.unwrap()).to_string());
+        }
+        let joined = emitted.join("");
+
+        assert!(
+            joined.contains("message_start"),
+            "missing message_start: {joined}"
+        );
+        assert!(
+            joined.contains("\"type\":\"text\""),
+            "missing text block: {joined}"
+        );
+        assert!(joined.contains("Hello"), "missing text delta: {joined}");
+        assert!(
+            joined.contains("\"type\":\"tool_use\""),
+            "missing tool_use: {joined}"
+        );
+        assert!(
+            joined.contains("search_repo"),
+            "missing tool name: {joined}"
+        );
+        assert!(
+            joined.contains("input_json_delta"),
+            "missing args delta: {joined}"
+        );
+        assert!(
+            joined.contains("\"stop_reason\":\"tool_use\""),
+            "expected tool_use stop reason: {joined}"
+        );
+        assert!(
+            joined.contains("message_stop"),
+            "missing message_stop: {joined}"
+        );
+
+        let usage = rx.await.unwrap();
+        assert_eq!(usage.input_tokens, 21);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_read_input_tokens, 4);
+    }
+
+    #[tokio::test]
     async fn openai_text_stream_translates_to_anthropic_events() {
         let stream = bytes_stream(vec![
             "data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}],\"usage\":null}\n\n",
@@ -735,7 +1228,11 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
             inner: Box::pin(stream),
-            adapter: StreamAdapter::new(Provider::OpenAi, "aura-gpt-4.1"),
+            adapter: StreamAdapter::new(
+                Provider::OpenAi,
+                OpenAiApi::ChatCompletions,
+                "aura-gpt-4.1",
+            ),
             usage_tx: Some(tx),
             finished: false,
             pending_output: VecDeque::new(),
@@ -777,7 +1274,11 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
             inner: Box::pin(stream),
-            adapter: StreamAdapter::new(Provider::OpenAi, "aura-gpt-4.1"),
+            adapter: StreamAdapter::new(
+                Provider::OpenAi,
+                OpenAiApi::ChatCompletions,
+                "aura-gpt-4.1",
+            ),
             usage_tx: Some(tx),
             finished: false,
             pending_output: VecDeque::new(),
@@ -814,7 +1315,11 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
             inner: Box::pin(stream),
-            adapter: StreamAdapter::new(Provider::DeepSeek, "aura-deepseek-v4-flash"),
+            adapter: StreamAdapter::new(
+                Provider::DeepSeek,
+                OpenAiApi::ChatCompletions,
+                "aura-deepseek-v4-flash",
+            ),
             usage_tx: Some(tx),
             finished: false,
             pending_output: VecDeque::new(),

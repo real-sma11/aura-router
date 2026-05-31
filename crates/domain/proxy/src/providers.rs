@@ -1,6 +1,7 @@
 //! Provider resolution — maps model names to LLM providers.
 
 use reqwest::header::{HeaderMap, HeaderValue};
+use serde_json::Value;
 
 /// Supported LLM providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,7 +175,45 @@ pub fn resolve_provider(model: &str) -> Option<Provider> {
     resolve_model(model).map(|resolved| resolved.provider)
 }
 
+/// Which OpenAI HTTP surface a request should use.
+///
+/// OpenAI's `/v1/chat/completions` rejects requests that combine function
+/// `tools` with `reasoning_effort` for the gpt-5 family ("Please use
+/// /v1/responses instead"). The `/v1/responses` API supports tools +
+/// reasoning together and is OpenAI's go-forward surface for tool use, so
+/// any tool-bearing OpenAI request is routed through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiApi {
+    ChatCompletions,
+    Responses,
+}
+
+/// Decide which OpenAI surface an inbound `/v1/messages` request maps to.
+///
+/// Returns [`OpenAiApi::Responses`] only for OpenAI requests that carry a
+/// non-empty `tools` array; everything else (including all non-OpenAI
+/// providers, for which the value is ignored) reports
+/// [`OpenAiApi::ChatCompletions`].
+pub fn openai_api_for_request(provider: Provider, request: &Value) -> OpenAiApi {
+    if provider != Provider::OpenAi {
+        return OpenAiApi::ChatCompletions;
+    }
+    let has_tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if has_tools {
+        OpenAiApi::Responses
+    } else {
+        OpenAiApi::ChatCompletions
+    }
+}
+
 /// Get the base URL for a provider's messages endpoint.
+///
+/// For OpenAI this returns the chat/completions surface; callers that may
+/// need the Responses API should use [`openai_endpoint_url`] with the
+/// [`OpenAiApi`] resolved from the request.
 pub fn provider_url(provider: &Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "https://api.anthropic.com/v1/messages",
@@ -183,6 +222,14 @@ pub fn provider_url(provider: &Provider) -> &'static str {
         // Aura Router centrally avoids Fireworks surfaces that can retain conversation state.
         Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
         Provider::DeepSeek => "https://api.deepseek.com/chat/completions",
+    }
+}
+
+/// Get the OpenAI endpoint URL for the given API surface.
+pub fn openai_endpoint_url(api: OpenAiApi) -> &'static str {
+    match api {
+        OpenAiApi::ChatCompletions => "https://api.openai.com/v1/chat/completions",
+        OpenAiApi::Responses => "https://api.openai.com/v1/responses",
     }
 }
 
@@ -258,7 +305,58 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_model, resolve_provider, Provider};
+    use super::{
+        openai_api_for_request, openai_endpoint_url, resolve_model, resolve_provider, OpenAiApi,
+        Provider,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn openai_tool_requests_route_to_responses_api() {
+        let request = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "search", "input_schema": {} }],
+        });
+        assert_eq!(
+            openai_api_for_request(Provider::OpenAi, &request),
+            OpenAiApi::Responses
+        );
+        assert_eq!(
+            openai_endpoint_url(openai_api_for_request(Provider::OpenAi, &request)),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn openai_requests_without_tools_use_chat_completions() {
+        let request = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        assert_eq!(
+            openai_api_for_request(Provider::OpenAi, &request),
+            OpenAiApi::ChatCompletions
+        );
+        let empty_tools = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [],
+        });
+        assert_eq!(
+            openai_api_for_request(Provider::OpenAi, &empty_tools),
+            OpenAiApi::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn non_openai_providers_never_select_responses_api() {
+        let request = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "search", "input_schema": {} }],
+        });
+        for provider in [Provider::Anthropic, Provider::Fireworks, Provider::DeepSeek] {
+            assert_eq!(
+                openai_api_for_request(provider, &request),
+                OpenAiApi::ChatCompletions
+            );
+        }
+    }
 
     #[test]
     fn resolves_aura_aliases_to_upstream_models() {
