@@ -1,5 +1,6 @@
 pub mod anthropic_compat;
 pub mod billing;
+pub mod google_compat;
 pub mod image_gen;
 pub mod providers;
 pub mod rate_limit;

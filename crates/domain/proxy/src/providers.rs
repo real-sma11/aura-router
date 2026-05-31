@@ -10,6 +10,7 @@ pub enum Provider {
     OpenAi,
     Fireworks,
     DeepSeek,
+    Google,
 }
 
 impl Provider {
@@ -20,6 +21,7 @@ impl Provider {
             Provider::OpenAi => "openai",
             Provider::Fireworks => "fireworks",
             Provider::DeepSeek => "deepseek",
+            Provider::Google => "google",
         }
     }
 }
@@ -162,6 +164,46 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/gemma-4-26b-a4b-it",
             provider: Provider::Fireworks,
         }),
+        // Google Gemini chat models route directly through the Google
+        // Generative Language API (`generativelanguage.googleapis.com`)
+        // using the platform GOOGLE_API_KEY. Pro models map to their
+        // current preview string; stable Flash/Flash-Lite tiers map to the
+        // bare stable name.
+        "aura-gemini-3-1-pro" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-3.1-pro-preview",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-3-5-flash" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-3.5-flash",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-3-flash" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-3-flash-preview",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-3-1-flash-lite" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-3.1-flash-lite",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-2-5-pro" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-2.5-pro",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-2-5-flash" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-2.5-flash",
+            provider: Provider::Google,
+        }),
+        "aura-gemini-2-5-flash-lite" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gemini-2.5-flash-lite",
+            provider: Provider::Google,
+        }),
         _ => None,
     }
 }
@@ -181,6 +223,8 @@ fn infer_provider(model: &str) -> Option<Provider> {
         || model == "deepseek-reasoner"
     {
         Some(Provider::DeepSeek)
+    } else if model.starts_with("gemini") {
+        Some(Provider::Google)
     } else {
         None
     }
@@ -251,7 +295,25 @@ pub fn provider_url(provider: &Provider) -> &'static str {
         // Aura Router centrally avoids Fireworks surfaces that can retain conversation state.
         Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
         Provider::DeepSeek => "https://api.deepseek.com/chat/completions",
+        // Google encodes the model + streaming mode in the path, so callers
+        // must use `google_endpoint_url` instead. This base is returned only
+        // to keep the match exhaustive.
+        Provider::Google => "https://generativelanguage.googleapis.com/v1beta",
     }
+}
+
+/// Google Generative Language endpoint for a Gemini chat request.
+///
+/// Unlike the other providers, Gemini puts the upstream model and the
+/// streaming mode in the URL path (`:generateContent` vs
+/// `:streamGenerateContent?alt=sse`) rather than the request body.
+pub fn google_endpoint_url(upstream_model: &str, streaming: bool) -> String {
+    let method = if streaming {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    };
+    format!("https://generativelanguage.googleapis.com/v1beta/models/{upstream_model}:{method}")
 }
 
 /// Get the OpenAI endpoint URL for the given API surface.
@@ -305,6 +367,8 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner" => {
             1_000_000
         }
+        // Google Gemini — the 2.5 and 3 families all expose a 1M token window.
+        m if m.starts_with("gemini") => 1_000_000,
         _ => 200_000, // safe default
     }
 }
@@ -334,6 +398,11 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
                 "authorization",
                 HeaderValue::from_str(&format!("Bearer {api_key}")).ok()?,
             );
+        }
+        Provider::Google => {
+            // The Generative Language API authenticates with a bare API key
+            // header rather than a Bearer token.
+            headers.insert("x-goog-api-key", HeaderValue::from_str(api_key).ok()?);
         }
     }
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -492,5 +561,42 @@ mod tests {
         assert_eq!(resolved.requested_model, "gpt-5.5");
         assert_eq!(resolved.upstream_model, "gpt-5.5");
         assert_eq!(resolved.provider, Provider::OpenAi);
+    }
+
+    #[test]
+    fn resolves_gemini_aliases_to_google() {
+        for (alias, upstream) in [
+            ("aura-gemini-3-1-pro", "gemini-3.1-pro-preview"),
+            ("aura-gemini-3-5-flash", "gemini-3.5-flash"),
+            ("aura-gemini-3-flash", "gemini-3-flash-preview"),
+            ("aura-gemini-3-1-flash-lite", "gemini-3.1-flash-lite"),
+            ("aura-gemini-2-5-pro", "gemini-2.5-pro"),
+            ("aura-gemini-2-5-flash", "gemini-2.5-flash"),
+            ("aura-gemini-2-5-flash-lite", "gemini-2.5-flash-lite"),
+        ] {
+            let resolved = resolve_model(alias).expect("aura gemini alias should resolve");
+            assert_eq!(resolved.upstream_model, upstream);
+            assert_eq!(resolved.provider, Provider::Google);
+        }
+    }
+
+    #[test]
+    fn infers_google_provider_for_raw_gemini_names() {
+        let resolved = resolve_model("gemini-2.5-flash").expect("api model should resolve");
+        assert_eq!(resolved.upstream_model, "gemini-2.5-flash");
+        assert_eq!(resolved.provider, Provider::Google);
+        assert_eq!(super::max_context_tokens("aura-gemini-2-5-pro"), 1_000_000);
+    }
+
+    #[test]
+    fn google_endpoint_url_encodes_model_and_streaming_mode() {
+        assert_eq!(
+            super::google_endpoint_url("gemini-2.5-pro", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+        assert_eq!(
+            super::google_endpoint_url("gemini-2.5-pro", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
     }
 }

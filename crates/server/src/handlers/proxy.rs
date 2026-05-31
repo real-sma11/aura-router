@@ -126,12 +126,20 @@ pub async fn messages(
             .deepseek_api_key
             .clone()
             .ok_or_else(|| AppError::BadRequest("DeepSeek provider not configured".into()))?,
+        providers::Provider::Google => state
+            .google_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("Google provider not configured".into()))?,
     };
 
-    // Forward to provider
-    let upstream_url = match provider {
-        providers::Provider::OpenAi => providers::openai_endpoint_url(openai_api),
-        other => providers::provider_url(&other),
+    // Forward to provider. Google encodes the model + streaming mode in the
+    // URL path, so it is built separately from the static per-provider URLs.
+    let upstream_url: String = match provider {
+        providers::Provider::OpenAi => providers::openai_endpoint_url(openai_api).to_string(),
+        providers::Provider::Google => {
+            providers::google_endpoint_url(resolved_model.upstream_model, is_streaming)
+        }
+        other => providers::provider_url(&other).to_string(),
     };
     let upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
@@ -430,6 +438,7 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
         "openai" => providers::Provider::OpenAi,
         "fireworks" => providers::Provider::Fireworks,
         "deepseek" => providers::Provider::DeepSeek,
+        "google" => providers::Provider::Google,
         _ => providers::Provider::Anthropic,
     }
 }
@@ -1326,6 +1335,82 @@ mod tests {
                 .unwrap_or_default()
                 > 0,
             "expected Fireworks output token count to be populated: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_live_smoke_for_aura_managed_model() {
+        dotenvy::dotenv().ok();
+        let Some(google_api_key) = std::env::var("GOOGLE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping Google live smoke test because GOOGLE_API_KEY is missing");
+            return;
+        };
+
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-google-smoke");
+        let (billing_url, _billing_handle) = start_mock_billing().await;
+
+        let mut state = test_state(cookie_secret, billing_url, "unused".to_string(), None, None);
+        state.google_api_key = Some(google_api_key);
+        let app = router::create_router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-gemini-2-5-flash",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Reply with exactly GOOGLE_OK and nothing else."
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("normalized anthropic response");
+        assert_eq!(response["model"], "aura-gemini-2-5-flash");
+        let text = response["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("GOOGLE_OK"),
+            "expected live Google response to contain GOOGLE_OK, got: {text}"
+        );
+        assert!(
+            response["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "expected Google input token count to be populated: {response}"
         );
     }
 }

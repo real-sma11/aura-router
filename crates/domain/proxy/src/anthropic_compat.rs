@@ -1,11 +1,18 @@
 use serde_json::{json, Value};
 
+use crate::google_compat;
 use crate::providers::Provider;
 
 pub fn validate_request(provider: Provider, request: &Value) -> Result<(), String> {
     match provider {
         Provider::Anthropic => Ok(()),
-        Provider::OpenAi | Provider::DeepSeek => validate_openai_request(request),
+        // Gemini accepts the same content-block subset the OpenAI lane
+        // validates (text/image/tool_result/tool_use) and uses
+        // `reasoning_effort` rather than Anthropic `thinking`, so the shared
+        // validator applies.
+        Provider::OpenAi | Provider::DeepSeek | Provider::Google => {
+            validate_openai_request(request)
+        }
         Provider::Fireworks => {
             validate_openai_request(request)?;
             validate_fireworks_privacy_policy(request)
@@ -37,6 +44,10 @@ pub fn request_to_upstream(
             apply_reasoning_effort(provider, request, &mut upstream);
             Ok(upstream)
         }
+        Provider::Google => {
+            validate_openai_request(request)?;
+            google_compat::request_to_gemini(upstream_model, request)
+        }
     }
 }
 
@@ -63,7 +74,9 @@ fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Va
             "high" | "xhigh" | "max" => Some("high"),
             _ => None,
         },
-        Provider::Anthropic | Provider::DeepSeek => None,
+        // Gemini effort maps to a `thinkingConfig` budget inside
+        // `google_compat`, never an OpenAI-style top-level field.
+        Provider::Anthropic | Provider::DeepSeek | Provider::Google => None,
     };
     if let (Some(effort), Some(obj)) = (mapped, upstream.as_object_mut()) {
         obj.insert(
@@ -402,6 +415,7 @@ pub fn response_from_upstream(
         Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
             openai_response_to_anthropic(response, requested_model)
         }
+        Provider::Google => google_compat::response_from_gemini(requested_model, response),
     }
 }
 

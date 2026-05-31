@@ -97,6 +97,69 @@ fn cache_aware_rates(provider: &str, model: &str) -> Option<CacheAwareRates> {
         "deepseek" => deepseek_rates(model),
         "openai" => openai_rates(model),
         "fireworks" => fireworks_rates(model),
+        "google" => google_rates(model),
+        _ => None,
+    }
+}
+
+/// Per-model rates for Google Gemini chat models (cents per million tokens),
+/// matching both the `aura-gemini-*` aliases and the raw upstream model
+/// names the streaming path may report. Gemini bills `promptTokenCount` as
+/// the full prompt (cached tokens included), so `input_tokens_is_new_only`
+/// is false; cached input is ~10% of the base input rate. Pro tiers use the
+/// flat (<=200k prompt) rate.
+fn google_rates(model: &str) -> Option<CacheAwareRates> {
+    let model = model.strip_prefix("google/").unwrap_or(model);
+    match model {
+        "aura-gemini-3-1-pro" | "gemini-3.1-pro-preview" => Some(CacheAwareRates {
+            new_input_cents_per_million: 200.0,
+            cache_write_input_cents_per_million: 200.0,
+            cache_read_input_cents_per_million: 20.0,
+            output_cents_per_million: 1200.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-3-5-flash" | "gemini-3.5-flash" => Some(CacheAwareRates {
+            new_input_cents_per_million: 150.0,
+            cache_write_input_cents_per_million: 150.0,
+            cache_read_input_cents_per_million: 15.0,
+            output_cents_per_million: 900.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-3-flash" | "gemini-3-flash-preview" => Some(CacheAwareRates {
+            new_input_cents_per_million: 50.0,
+            cache_write_input_cents_per_million: 50.0,
+            cache_read_input_cents_per_million: 5.0,
+            output_cents_per_million: 300.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-3-1-flash-lite" | "gemini-3.1-flash-lite" => Some(CacheAwareRates {
+            new_input_cents_per_million: 25.0,
+            cache_write_input_cents_per_million: 25.0,
+            cache_read_input_cents_per_million: 2.5,
+            output_cents_per_million: 150.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-2-5-pro" | "gemini-2.5-pro" => Some(CacheAwareRates {
+            new_input_cents_per_million: 125.0,
+            cache_write_input_cents_per_million: 125.0,
+            cache_read_input_cents_per_million: 12.5,
+            output_cents_per_million: 1000.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-2-5-flash" | "gemini-2.5-flash" => Some(CacheAwareRates {
+            new_input_cents_per_million: 30.0,
+            cache_write_input_cents_per_million: 30.0,
+            cache_read_input_cents_per_million: 3.0,
+            output_cents_per_million: 250.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gemini-2-5-flash-lite" | "gemini-2.5-flash-lite" => Some(CacheAwareRates {
+            new_input_cents_per_million: 10.0,
+            cache_write_input_cents_per_million: 10.0,
+            cache_read_input_cents_per_million: 1.0,
+            output_cents_per_million: 40.0,
+            input_tokens_is_new_only: false,
+        }),
         _ => None,
     }
 }
@@ -529,6 +592,29 @@ mod tests {
         );
         assert_eq!(
             cache_aware_cost_cents("openai", "gpt-4.1", 1_000_000, 500_000, 0, 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn google_gemini_cache_aware_cost_discounts_cached_tokens() {
+        // gemini-2.5-pro: new 0, cache_read 1M × 12.5, output 500k × 1000.
+        // (12_500_000 + 500_000_000) × 1.2 / 1M = 615
+        assert_eq!(
+            cache_aware_cost_cents("google", "aura-gemini-2-5-pro", 1_000_000, 500_000, 0, 1_000_000),
+            Some(615)
+        );
+        // Raw upstream name resolves to the same rate table.
+        assert_eq!(
+            cache_aware_cost_cents("google", "gemini-2.5-flash", 1_000_000, 500_000, 0, 1_000_000),
+            cache_aware_cost_cents("google", "aura-gemini-2-5-flash", 1_000_000, 500_000, 0, 1_000_000),
+        );
+    }
+
+    #[test]
+    fn google_cost_override_is_absent_without_cached_tokens() {
+        assert_eq!(
+            cache_aware_cost_cents("google", "aura-gemini-2-5-pro", 1_000_000, 500_000, 0, 0),
             None
         );
     }
