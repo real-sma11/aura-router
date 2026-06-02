@@ -7,7 +7,11 @@ pub use super::video_types::*;
 
 const VEO_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const POLL_INTERVAL_MS: u64 = 10_000;
-const MAX_POLL_ATTEMPTS: u32 = 40; // 40 × 10s = ~6.5 minutes max
+// Veo generation time is highly variable for the same prompt/model (queue/load
+// dependent). 400s was too tight and caused intermittent false "timed out"
+// errors on jobs that would have succeeded. The SSE progress events below keep
+// the connection alive across the longer window.
+const MAX_POLL_ATTEMPTS: u32 = 90; // 90 × 10s = 15 minutes max
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub fn get_config() -> VideoGenConfig {
