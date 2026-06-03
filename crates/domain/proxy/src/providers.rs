@@ -208,16 +208,6 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/qwen3p6-plus",
             provider: Provider::Fireworks,
         }),
-        "aura-gemma-4-31b" => Some(ResolvedModel {
-            requested_model: model,
-            upstream_model: "accounts/fireworks/models/gemma-4-31b-it",
-            provider: Provider::Fireworks,
-        }),
-        "aura-gemma-4-26b-a4b" => Some(ResolvedModel {
-            requested_model: model,
-            upstream_model: "accounts/fireworks/models/gemma-4-26b-a4b-it",
-            provider: Provider::Fireworks,
-        }),
         // Google Gemini chat models route directly through the Google
         // Generative Language API (`generativelanguage.googleapis.com`)
         // using the platform GOOGLE_API_KEY. Pro models map to their
@@ -455,8 +445,6 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "accounts/fireworks/models/minimax-m2p7" => 196_608,
         "accounts/fireworks/models/glm-5p1" => 202_752,
         "accounts/fireworks/models/qwen3p6-plus" => 262_144,
-        "accounts/fireworks/models/gemma-4-31b-it" => 262_144,
-        "accounts/fireworks/models/gemma-4-26b-a4b-it" => 262_144,
         // DeepSeek V4 via Fireworks
         "accounts/fireworks/models/deepseek-v4-pro"
         | "accounts/fireworks/models/deepseek-v4-flash" => 1_000_000,
@@ -591,7 +579,6 @@ mod tests {
             ("aura-gpt-5-5", "OpenAI"),
             ("aura-oss-120b", "OpenAI"),
             ("aura-gemini-3-1-pro", "Google"),
-            ("aura-gemma-4-31b", "Google"),
             ("aura-deepseek-v4-pro", "DeepSeek AI"),
             ("deepseek/deepseek-v4-flash", "DeepSeek AI"),
             ("aura-kimi-k2-6", "Moonshot AI"),
@@ -669,11 +656,6 @@ mod tests {
             ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
-            ("aura-gemma-4-31b", "accounts/fireworks/models/gemma-4-31b-it"),
-            (
-                "aura-gemma-4-26b-a4b",
-                "accounts/fireworks/models/gemma-4-26b-a4b-it",
-            ),
         ] {
             let resolved = resolve_model(alias).expect("aura alias should resolve");
             assert_eq!(resolved.upstream_model, upstream);

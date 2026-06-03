@@ -364,24 +364,6 @@ fn fireworks_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 300.0,
             input_tokens_is_new_only: false,
         }),
-        // Gemma models are tier-priced by Fireworks (uniform input/output, no
-        // separate cached-input discount), so cache reads bill at the base rate.
-        "aura-gemma-4-31b" | "accounts/fireworks/models/gemma-4-31b-it" => Some(CacheAwareRates {
-            new_input_cents_per_million: 90.0,
-            cache_write_input_cents_per_million: 90.0,
-            cache_read_input_cents_per_million: 90.0,
-            output_cents_per_million: 90.0,
-            input_tokens_is_new_only: false,
-        }),
-        "aura-gemma-4-26b-a4b" | "accounts/fireworks/models/gemma-4-26b-a4b-it" => {
-            Some(CacheAwareRates {
-                new_input_cents_per_million: 50.0,
-                cache_write_input_cents_per_million: 50.0,
-                cache_read_input_cents_per_million: 50.0,
-                output_cents_per_million: 50.0,
-                input_tokens_is_new_only: false,
-            })
-        }
         _ => None,
     }
 }
@@ -816,11 +798,6 @@ mod tests {
             ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
-            ("aura-gemma-4-31b", "accounts/fireworks/models/gemma-4-31b-it"),
-            (
-                "aura-gemma-4-26b-a4b",
-                "accounts/fireworks/models/gemma-4-26b-a4b-it",
-            ),
         ] {
             let via_alias =
                 cache_aware_cost_cents("fireworks", alias, 1_000_000, 500_000, 0, 200_000);
