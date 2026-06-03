@@ -188,6 +188,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/qwen2p5-coder-7b",
             provider: Provider::Fireworks,
         }),
+        "aura-minimax-m3" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/minimax-m3",
+            provider: Provider::Fireworks,
+        }),
         "aura-minimax-m2-7" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "accounts/fireworks/models/minimax-m2p7",
@@ -446,6 +451,7 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "accounts/fireworks/models/kimi-k2p6" => 262_144,
         "accounts/fireworks/models/gpt-oss-120b" => 131_072,
         "accounts/fireworks/models/qwen2p5-coder-7b" => 32_768,
+        "accounts/fireworks/models/minimax-m3" => 262_144,
         "accounts/fireworks/models/minimax-m2p7" => 196_608,
         "accounts/fireworks/models/glm-5p1" => 202_752,
         "accounts/fireworks/models/qwen3p6-plus" => 262_144,
@@ -589,6 +595,7 @@ mod tests {
             ("aura-deepseek-v4-pro", "DeepSeek AI"),
             ("deepseek/deepseek-v4-flash", "DeepSeek AI"),
             ("aura-kimi-k2-6", "Moonshot AI"),
+            ("aura-minimax-m3", "MiniMax"),
             ("aura-minimax-m2-7", "MiniMax"),
             ("aura-glm-5-1", "Z.ai"),
             ("aura-qwen3-6-plus", "Alibaba Cloud"),
@@ -658,6 +665,7 @@ mod tests {
     #[test]
     fn resolves_new_fireworks_models() {
         for (alias, upstream) in [
+            ("aura-minimax-m3", "accounts/fireworks/models/minimax-m3"),
             ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),

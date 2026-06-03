@@ -336,6 +336,13 @@ fn fireworks_rates(model: &str) -> Option<CacheAwareRates> {
                 input_tokens_is_new_only: false,
             })
         }
+        "aura-minimax-m3" | "accounts/fireworks/models/minimax-m3" => Some(CacheAwareRates {
+            new_input_cents_per_million: 40.0,
+            cache_write_input_cents_per_million: 40.0,
+            cache_read_input_cents_per_million: 8.0,
+            output_cents_per_million: 160.0,
+            input_tokens_is_new_only: false,
+        }),
         "aura-minimax-m2-7" | "accounts/fireworks/models/minimax-m2p7" => Some(CacheAwareRates {
             new_input_cents_per_million: 30.0,
             cache_write_input_cents_per_million: 30.0,
@@ -805,6 +812,7 @@ mod tests {
     #[test]
     fn new_fireworks_models_aura_aliases_resolve_to_same_rates() {
         for (alias, upstream) in [
+            ("aura-minimax-m3", "accounts/fireworks/models/minimax-m3"),
             ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
