@@ -91,12 +91,32 @@ impl S3Config {
         Ok(self.public_url(&key))
     }
 
+    /// Sanitize an optional key prefix: strip leading/trailing slashes and
+    /// allow only `[a-zA-Z0-9/_-]`. Returns `None` when the result is empty.
+    fn sanitize_prefix(prefix: Option<&str>) -> Option<String> {
+        let prefix = prefix?;
+        let cleaned: String = prefix
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-'))
+            .collect();
+        let trimmed = cleaned.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     /// Generate a presigned PUT URL for direct client-side upload.
+    ///
+    /// When `prefix` is provided, the sanitized prefix is prepended to the
+    /// generated object key (e.g. `blogs/uploads/{user_id}/...`).
     pub async fn presign_upload(
         &self,
         user_id: &str,
         content_type: &str,
         filename: &str,
+        prefix: Option<&str>,
     ) -> Result<PresignedUpload, String> {
         const ALLOWED_TYPES: &[&str] = &[
             "image/jpeg",
@@ -111,7 +131,11 @@ impl S3Config {
         }
 
         let extension = filename.rsplit('.').next().unwrap_or("bin");
-        let key = Self::generate_key(user_id, "upload", extension);
+        let base_key = Self::generate_key(user_id, "upload", extension);
+        let key = match Self::sanitize_prefix(prefix) {
+            Some(prefix) => format!("{prefix}/{base_key}"),
+            None => base_key,
+        };
 
         let presigning_config = aws_sdk_s3::presigning::PresigningConfig::builder()
             .expires_in(std::time::Duration::from_secs(900))

@@ -14,6 +14,10 @@ use crate::state::AppState;
 pub struct PresignRequest {
     pub content_type: String,
     pub filename: String,
+    /// Optional key prefix prepended to the generated object key
+    /// (e.g. `blogs`). Sanitized server-side; existing callers may omit it.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// POST /v1/upload/presign
@@ -35,7 +39,12 @@ pub async fn presign_upload(
     }
 
     let result = s3
-        .presign_upload(&auth.user_id, &input.content_type, &input.filename)
+        .presign_upload(
+            &auth.user_id,
+            &input.content_type,
+            &input.filename,
+            input.prefix.as_deref(),
+        )
         .await
         .map_err(|e| AppError::BadRequest(e))?;
 
