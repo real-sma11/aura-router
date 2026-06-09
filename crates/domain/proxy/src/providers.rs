@@ -84,6 +84,11 @@ pub struct ResolvedModel<'a> {
 
 fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
     match model {
+        "aura-claude-fable-5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-fable-5",
+            provider: Provider::Anthropic,
+        }),
         "aura-claude-opus-4-8" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "claude-opus-4-8",
@@ -417,6 +422,7 @@ pub fn max_context_tokens(model: &str) -> u64 {
         .unwrap_or(model);
     match resolved_model {
         // Anthropic
+        m if m.starts_with("claude-fable-5") => 1_000_000,
         m if m.starts_with("claude-opus-4") => 1_000_000,
         m if m.starts_with("claude-sonnet-4") => 1_000_000,
         m if m.starts_with("claude-haiku-4") => 200_000,
@@ -551,6 +557,12 @@ mod tests {
 
     #[test]
     fn resolves_aura_aliases_to_upstream_models() {
+        let resolved = resolve_model("aura-claude-fable-5").expect("model alias should resolve");
+        assert_eq!(resolved.requested_model, "aura-claude-fable-5");
+        assert_eq!(resolved.upstream_model, "claude-fable-5");
+        assert_eq!(resolved.provider, Provider::Anthropic);
+        assert_eq!(super::max_context_tokens("aura-claude-fable-5"), 1_000_000);
+
         let resolved = resolve_model("aura-gpt-5-5").expect("model alias should resolve");
         assert_eq!(resolved.requested_model, "aura-gpt-5-5");
         assert_eq!(resolved.upstream_model, "gpt-5.5");
