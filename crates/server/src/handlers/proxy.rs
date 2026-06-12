@@ -141,8 +141,17 @@ pub async fn messages(
         }
         other => providers::provider_url(&other).to_string(),
     };
-    let upstream_headers = providers::provider_headers(&provider, &api_key)
+    let mut upstream_headers = providers::provider_headers(&provider, &api_key)
         .ok_or_else(|| AppError::Internal("Invalid API key format".into()))?;
+    if provider == providers::Provider::Anthropic {
+        if let Some(inbound_beta) = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+        {
+            providers::merge_anthropic_beta_header(&mut upstream_headers, inbound_beta)
+                .ok_or_else(|| AppError::Internal("Invalid Anthropic beta header".into()))?;
+        }
+    }
     let mut upstream_request_value = match openai_api {
         providers::OpenAiApi::Responses => anthropic_compat::anthropic_request_to_openai_responses(
             &request_value,

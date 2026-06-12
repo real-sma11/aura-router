@@ -3,6 +3,10 @@
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
+const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+const PROMPT_CACHING_BETA: &str = "prompt-caching-2024-07-31";
+const COMPUTER_USE_BETA: &str = "computer-use-2025-01-24";
+
 /// Supported LLM providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -474,8 +478,8 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
             headers.insert("x-api-key", HeaderValue::from_str(api_key).ok()?);
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             headers.insert(
-                "anthropic-beta",
-                HeaderValue::from_static("prompt-caching-2024-07-31"),
+                ANTHROPIC_BETA_HEADER,
+                HeaderValue::from_static(PROMPT_CACHING_BETA),
             );
         }
         Provider::OpenAi | Provider::DeepSeek => {
@@ -500,11 +504,32 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
     Some(headers)
 }
 
+/// Merge Anthropic beta tokens from an inbound proxy request into the
+/// provider-bound header. Only beta programs AURA Router explicitly supports
+/// are forwarded; arbitrary client-supplied beta values are ignored.
+pub fn merge_anthropic_beta_header(headers: &mut HeaderMap, inbound_beta: &str) -> Option<()> {
+    let mut tokens = vec![PROMPT_CACHING_BETA.to_string()];
+    for token in inbound_beta
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if token == COMPUTER_USE_BETA && !tokens.iter().any(|existing| existing == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    headers.insert(
+        ANTHROPIC_BETA_HEADER,
+        HeaderValue::from_str(&tokens.join(",")).ok()?,
+    );
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        model_maker, openai_api_for_request, openai_endpoint_url, resolve_model, resolve_provider,
-        OpenAiApi, Provider,
+        merge_anthropic_beta_header, model_maker, openai_api_for_request, openai_endpoint_url,
+        provider_headers, resolve_model, resolve_provider, OpenAiApi, Provider,
     };
     use serde_json::json;
 
@@ -538,6 +563,25 @@ mod tests {
         assert_eq!(
             openai_api_for_request(Provider::OpenAi, &empty_tools),
             OpenAiApi::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn anthropic_headers_forward_computer_use_beta() {
+        let mut headers =
+            provider_headers(&Provider::Anthropic, "sk-ant").expect("valid api key header");
+
+        merge_anthropic_beta_header(
+            &mut headers,
+            "computer-use-2025-01-24,unknown-beta-2099-01-01,prompt-caching-2024-07-31",
+        )
+        .expect("valid merged beta header");
+
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("prompt-caching-2024-07-31,computer-use-2025-01-24")
         );
     }
 
