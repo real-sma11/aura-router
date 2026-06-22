@@ -479,8 +479,32 @@ fn apply_provider_request_controls(
 }
 
 fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
-    let message = extract_upstream_error_message(error_body)
+    let raw_message = extract_upstream_error_message(error_body)
         .unwrap_or_else(|| format!("Upstream provider returned HTTP {}", status.as_u16()));
+
+    // When the upstream provider ACCOUNT is out of credits / over its billing
+    // limit (a single shared key, never the end user's), the provider's raw
+    // "credit balance too low — go to Plans & Billing" copy makes every user
+    // think *their own* credits are the problem, when it's our account needing
+    // a top-up. Log it loudly so we notice and top up, and replace only the
+    // user-facing text with a clear our-side message. Status and error type
+    // are passed through unchanged so the client's retry/terminal handling is
+    // identical to today's behaviour — the original 400 stays terminal rather
+    // than being reclassified as a retryable 5xx, so this does not trigger a
+    // client-side retry storm against a condition only a human top-up fixes.
+    let message = if is_provider_account_billing_error(&raw_message) {
+        tracing::error!(
+            upstream_status = %status,
+            upstream_message = %raw_message,
+            "Upstream provider account is out of credits or over its billing limit — top up \
+             the shared provider account; users are being shielded with a generic message"
+        );
+        "AURA is temporarily unable to reach the model provider. This is an issue on our side, \
+         not with your account or credits. Please try again shortly."
+            .to_string()
+    } else {
+        raw_message
+    };
 
     (
         status,
@@ -497,6 +521,18 @@ fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Detect an upstream error that means *the shared provider account* has run
+/// out of credits or hit its billing/spend limit (as opposed to a malformed
+/// request). End users never supply their own provider key, so any
+/// provider-side "credit balance" / "Plans & Billing" rejection is by
+/// definition our account — safe to detect on that signature and reword.
+fn is_provider_account_billing_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("credit balance is too low")
+        || m.contains("plans & billing")
+        || m.contains("plans and billing")
 }
 
 fn anthropic_error_type(status: StatusCode) -> &'static str {
@@ -874,6 +910,52 @@ mod tests {
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["message"], "tools[0] is invalid");
+    }
+
+    #[tokio::test]
+    async fn shields_users_from_provider_account_billing_errors() {
+        // Anthropic's verbatim message when the *account's* credit balance is
+        // depleted. Forwarding this confuses users into thinking it's their
+        // own credits, so the user-facing text must be reworded.
+        let response = super::normalize_upstream_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.","type":"invalid_request_error"}}"#,
+        );
+
+        // Status and error type are passed through unchanged so the client's
+        // terminal/retry classification is identical to today (a 400 stays
+        // terminal — no retry storm against a human-top-up-only condition).
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().expect("message string");
+        // Exact rendered text — also guards against stray whitespace from the
+        // multi-line string continuations in the source.
+        assert_eq!(
+            message,
+            "AURA is temporarily unable to reach the model provider. This is an issue on our \
+             side, not with your account or credits. Please try again shortly."
+        );
+        // The provider's billing copy must not leak to the end user.
+        assert!(!message.to_ascii_lowercase().contains("plans & billing"));
+        assert!(!message.to_ascii_lowercase().contains("credit balance"));
+    }
+
+    #[test]
+    fn detects_provider_account_billing_signature() {
+        assert!(super::is_provider_account_billing_error(
+            "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
+        ));
+        // A genuinely malformed-request error must NOT be misclassified.
+        assert!(!super::is_provider_account_billing_error(
+            "tools[0] is invalid"
+        ));
     }
 
     #[tokio::test]
