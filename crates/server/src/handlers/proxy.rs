@@ -482,22 +482,25 @@ fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
     let raw_message = extract_upstream_error_message(error_body)
         .unwrap_or_else(|| format!("Upstream provider returned HTTP {}", status.as_u16()));
 
-    // When the upstream provider ACCOUNT is out of credits / over its billing
-    // limit (a single shared key, never the end user's), the provider's raw
-    // "credit balance too low — go to Plans & Billing" copy makes every user
-    // think *their own* credits are the problem, when it's our account needing
-    // a top-up. Log it loudly so we notice and top up, and replace only the
-    // user-facing text with a clear our-side message. Status and error type
-    // are passed through unchanged so the client's retry/terminal handling is
-    // identical to today's behaviour — the original 400 stays terminal rather
-    // than being reclassified as a retryable 5xx, so this does not trigger a
-    // client-side retry storm against a condition only a human top-up fixes.
-    let message = if is_provider_account_billing_error(&raw_message) {
+    // When the upstream provider ACCOUNT has a billing/account problem — out of
+    // credits, suspended, or over its spend quota (a single shared key, never
+    // the end user's) — the provider's raw copy (e.g. Anthropic "credit balance
+    // too low — Plans & Billing", Fireworks "Account X is suspended", OpenAI
+    // "exceeded your current quota") both makes users think it's *their* fault
+    // and can leak our account identifiers. Log it loudly so we notice and fix
+    // the account, and replace only the user-facing text with a clear our-side
+    // message. Status and error type are passed through unchanged so the
+    // client's retry/terminal handling is identical to today's behaviour — a
+    // terminal 400/412 stays terminal rather than being reclassified as a
+    // retryable 5xx, so this does not trigger a retry storm against a condition
+    // only a human account fix resolves.
+    let message = if is_provider_account_error(&raw_message) {
         tracing::error!(
             upstream_status = %status,
             upstream_message = %raw_message,
-            "Upstream provider account is out of credits or over its billing limit — top up \
-             the shared provider account; users are being shielded with a generic message"
+            "Upstream provider account has a billing/account problem (out of credits, suspended, \
+             or over quota) — fix the shared provider account; users are shielded with a generic \
+             message"
         );
         "AURA is temporarily unable to reach the model provider. This is an issue on our side, \
          not with your account or credits. Please try again shortly."
@@ -523,16 +526,30 @@ fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
         .into_response()
 }
 
-/// Detect an upstream error that means *the shared provider account* has run
-/// out of credits or hit its billing/spend limit (as opposed to a malformed
-/// request). End users never supply their own provider key, so any
-/// provider-side "credit balance" / "Plans & Billing" rejection is by
-/// definition our account — safe to detect on that signature and reword.
-fn is_provider_account_billing_error(message: &str) -> bool {
+/// Detect an upstream error that means *the shared provider account* has an
+/// account-level problem — out of credits, suspended, or over its spend quota —
+/// as opposed to a genuine malformed request. End users never supply their own
+/// provider key, so any of these is by definition our account: safe to detect
+/// and replace the user-facing text.
+///
+/// Matches deliberately-specific phrases per provider, NOT bare
+/// "billing"/"quota"/"limit", so genuine request errors and transient rate
+/// limits (which carry their own actionable messages and should pass through)
+/// are never misclassified.
+fn is_provider_account_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
+    // Anthropic — out of credits.
     m.contains("credit balance is too low")
         || m.contains("plans & billing")
         || m.contains("plans and billing")
+        // Fireworks — account suspended / unpaid / budget cap.
+        || m.contains("is suspended")
+        || m.contains("spending limit")
+        || m.contains("past invoices")
+        || m.contains("failure to pay")
+        // OpenAI — account quota exhausted (NOT transient rate-limit).
+        || m.contains("insufficient_quota")
+        || m.contains("exceeded your current quota")
 }
 
 fn anthropic_error_type(status: StatusCode) -> &'static str {
@@ -947,14 +964,107 @@ mod tests {
         assert!(!message.to_ascii_lowercase().contains("credit balance"));
     }
 
+    #[tokio::test]
+    async fn shields_users_from_fireworks_suspension() {
+        // Fireworks' verbatim suspension message leaks the account name and a
+        // billing URL, and reads like the *user* is suspended. Must be replaced.
+        let response = super::normalize_upstream_error(
+            StatusCode::PRECONDITION_FAILED,
+            br#"{"error":{"message":"Account acme-7 is suspended, possibly due to reaching the monthly spending limit or failure to pay past invoices. Please go to https://fireworks.ai/account/billing for more information.","type":"api_error"}}"#,
+        );
+
+        // Status passed through unchanged (412) so report-based triage still works.
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        let message = body["error"]["message"].as_str().expect("message string");
+
+        assert_eq!(
+            message,
+            "AURA is temporarily unable to reach the model provider. This is an issue on our \
+             side, not with your account or credits. Please try again shortly."
+        );
+        // No account id, billing URL, or "suspended" framing reaches the user.
+        let lower = message.to_ascii_lowercase();
+        assert!(!lower.contains("acme"));
+        assert!(!lower.contains("suspended"));
+        assert!(!lower.contains("fireworks"));
+        assert!(!lower.contains("invoices"));
+    }
+
+    #[tokio::test]
+    async fn shields_users_from_openai_quota_error() {
+        let response = super::normalize_upstream_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        let message = body["error"]["message"].as_str().expect("message string");
+
+        assert_eq!(
+            message,
+            "AURA is temporarily unable to reach the model provider. This is an issue on our \
+             side, not with your account or credits. Please try again shortly."
+        );
+        assert!(!message.to_ascii_lowercase().contains("quota"));
+    }
+
+    #[tokio::test]
+    async fn passes_through_genuine_request_errors() {
+        // A real invalid-request error (here an unsupported reasoning effort for a
+        // model) is the user's/UI's to act on, so it must NOT be shielded — the
+        // provider's actionable message passes through unchanged.
+        let response = super::normalize_upstream_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'gpt-5.4-nano' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        // Unchanged — the real, actionable provider message reaches the user.
+        assert_eq!(
+            body["error"]["message"],
+            "Unsupported value: 'minimal' is not supported with the 'gpt-5.4-nano' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."
+        );
+    }
+
     #[test]
-    fn detects_provider_account_billing_signature() {
-        assert!(super::is_provider_account_billing_error(
+    fn detects_provider_account_errors_across_providers() {
+        // Anthropic — out of credits.
+        assert!(super::is_provider_account_error(
             "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
         ));
-        // A genuinely malformed-request error must NOT be misclassified.
-        assert!(!super::is_provider_account_billing_error(
-            "tools[0] is invalid"
+        // Fireworks — account suspended.
+        assert!(super::is_provider_account_error(
+            "Account acme-7 is suspended, possibly due to reaching the monthly spending limit or failure to pay past invoices. Please go to https://fireworks.ai/account/billing for more information."
+        ));
+        // OpenAI — account quota exhausted.
+        assert!(super::is_provider_account_error(
+            "You exceeded your current quota, please check your plan and billing details."
+        ));
+        assert!(super::is_provider_account_error("insufficient_quota"));
+
+        // Genuine request errors and transient rate limits carry actionable
+        // messages and must NOT be misclassified — they pass through untouched.
+        assert!(!super::is_provider_account_error("tools[0] is invalid"));
+        assert!(!super::is_provider_account_error(
+            "Unsupported value: 'minimal' is not supported with the 'gpt-5.4-nano' model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."
+        ));
+        assert!(!super::is_provider_account_error(
+            "Rate limit reached for gpt-5.5 in organization org-xxx. Please try again in 1s."
         ));
     }
 
