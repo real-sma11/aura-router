@@ -18,7 +18,7 @@ The platform API key never reaches the client — it lives only on the server.
 
 - Rust toolchain
 - z-billing service running (for credit checks)
-- Anthropic API key (and optionally OpenAI)
+- Anthropic API key (and optionally OpenAI/xAI)
 
 ### Setup
 
@@ -48,6 +48,7 @@ curl http://localhost:3000/health
 | `INTERNAL_SERVICE_TOKEN` | Yes | Token for service-to-service auth |
 | `ANTHROPIC_API_KEY` | Yes | Platform Anthropic API key |
 | `OPENAI_API_KEY` | No | Platform OpenAI API key (required for GPT models) |
+| `XAI_API_KEY` | No | Platform xAI API key (required for Grok models and xAI Remote MCP tools) |
 | `Z_BILLING_URL` | Yes | z-billing service URL |
 | `Z_BILLING_API_KEY` | Yes | z-billing service API key |
 | `AURA_NETWORK_URL` | No | aura-network URL for usage recording |
@@ -85,15 +86,19 @@ aura-router
     |-- 1. Validate JWT
     |-- 2. Check credits (z-billing)
     |-- 3. [Enrichment hook - future]
-    |-- 4. Forward to provider (Anthropic / OpenAI)
+    |-- 4. Forward to provider (Anthropic / OpenAI / xAI)
     |-- 5. Stream response back to client
     |-- 6. Debit credits (z-billing)
     |-- 7. Record usage (aura-network)
     |-- 8. Store messages (aura-storage)
     |
     v
-LLM Provider (api.anthropic.com / api.openai.com)
+LLM Provider (api.anthropic.com / api.openai.com / api.x.ai)
 ```
+
+Grok requests with tools, `xai_tools`, `server_tools`, or `xai_mcp_servers`
+route through xAI's OpenAI-compatible Responses API so Remote MCP and
+server-side xAI tools can run upstream.
 
 ---
 

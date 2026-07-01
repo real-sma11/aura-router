@@ -91,10 +91,38 @@ The `model` field determines which upstream provider handles the request.
 |-------------|----------|-------------------|
 | `claude-*` | Anthropic | `https://api.anthropic.com/v1/messages` |
 | `gpt-*`, `o1-*`, `o3-*`, `o4-*`, `codex-*` | OpenAI | `https://api.openai.com/v1/chat/completions` |
+| `grok-*`, `aura-grok-*`, `xai/grok-*` | xAI | `https://api.x.ai/v1/chat/completions` or `https://api.x.ai/v1/responses` when tools are present |
 
 Unsupported model prefixes return `400 Bad Request`.
 
 OpenAI routing requires the `OPENAI_API_KEY` environment variable to be configured; if it is absent, requests for OpenAI models return `400 Bad Request`.
+xAI routing requires the `XAI_API_KEY` environment variable to be configured; if it is absent, requests for Grok models return `400 Bad Request`.
+
+#### xAI Tools and Remote MCP
+
+Grok requests that include any non-empty `tools`, `xai_tools`, `server_tools`, or `xai_mcp_servers` array are routed through xAI's OpenAI-compatible Responses API. Anthropic-style `tools` are translated into Responses function tools. xAI-native server-side tool objects are passed through from `xai_tools` or `server_tools`.
+
+Remote MCP servers can be supplied with `xai_mcp_servers`:
+
+```json
+{
+  "model": "aura-grok-4-3",
+  "max_tokens": 512,
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "Search the docs" }] }
+  ],
+  "xai_mcp_servers": [
+    {
+      "server_url": "https://mcp.deepwiki.com/mcp",
+      "server_label": "deepwiki",
+      "server_description": "Documentation search",
+      "allowed_tools": ["ask_question"]
+    }
+  ]
+}
+```
+
+`server_url` and `server_label` are required. `server_description`, `allowed_tools`, `authorization`, and `headers` are forwarded when provided.
 
 #### Non-Streaming Response
 
@@ -493,6 +521,7 @@ No additional charge on status check.
 | `INTERNAL_SERVICE_TOKEN` | Yes | — | Token for service-to-service authentication |
 | `ANTHROPIC_API_KEY` | Yes | — | Platform Anthropic API key (used for all `claude-*` requests) |
 | `OPENAI_API_KEY` | No | — | Platform OpenAI API key (required for `gpt-*`/`o1-*`/`o3-*`/`o4-*`/`codex-*` models) |
+| `XAI_API_KEY` | No | — | Platform xAI API key (required for `grok-*`, `aura-grok-*`, and xAI Remote MCP tool requests) |
 | `Z_BILLING_URL` | Yes | — | z-billing service base URL |
 | `Z_BILLING_API_KEY` | Yes | — | API key for z-billing requests |
 | `AURA_NETWORK_URL` | No | — | aura-network base URL for usage recording |
