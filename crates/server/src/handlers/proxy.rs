@@ -118,6 +118,10 @@ pub async fn messages(
             .openai_api_key
             .clone()
             .ok_or_else(|| AppError::BadRequest("OpenAI provider not configured".into()))?,
+        providers::Provider::Xai => state
+            .xai_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("xAI provider not configured".into()))?,
         providers::Provider::Fireworks => state
             .fireworks_api_key
             .clone()
@@ -136,6 +140,7 @@ pub async fn messages(
     // URL path, so it is built separately from the static per-provider URLs.
     let upstream_url: String = match provider {
         providers::Provider::OpenAi => providers::openai_endpoint_url(openai_api).to_string(),
+        providers::Provider::Xai => providers::xai_endpoint_url(openai_api).to_string(),
         providers::Provider::Google => {
             providers::google_endpoint_url(resolved_model.upstream_model, is_streaming)
         }
@@ -153,7 +158,8 @@ pub async fn messages(
         }
     }
     let mut upstream_request_value = match openai_api {
-        providers::OpenAiApi::Responses => anthropic_compat::anthropic_request_to_openai_responses(
+        providers::OpenAiApi::Responses => anthropic_compat::anthropic_request_to_responses(
+            provider,
             &request_value,
             resolved_model.upstream_model,
         )
@@ -165,11 +171,7 @@ pub async fn messages(
         )
         .map_err(AppError::BadRequest)?,
     };
-    apply_provider_request_controls(
-        provider,
-        &mut upstream_request_value,
-        session_ctx.as_ref(),
-    );
+    apply_provider_request_controls(provider, &mut upstream_request_value, session_ctx.as_ref());
     let upstream_body = serde_json::to_vec(&upstream_request_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
@@ -242,6 +244,10 @@ async fn handle_non_streaming(
 
     let upstream_value: serde_json::Value = serde_json::from_slice(&response_bytes)
         .map_err(|e| AppError::ProviderError(format!("Provider returned invalid JSON: {e}")))?;
+    let provider_reported_cost_cents = upstream_value
+        .pointer("/usage/cost_in_usd_ticks")
+        .and_then(|value| value.as_u64())
+        .and_then(billing::marked_up_cost_cents_from_usd_ticks);
     let response_value = match openai_api {
         providers::OpenAiApi::Responses => {
             anthropic_compat::openai_responses_to_anthropic(&upstream_value, model)
@@ -295,6 +301,7 @@ async fn handle_non_streaming(
         output_tokens,
         cache_creation_input_tokens,
         cache_read_input_tokens,
+        provider_reported_cost_cents,
         duration_ms,
     );
 
@@ -393,6 +400,7 @@ async fn handle_streaming(
                 usage.output_tokens,
                 usage.cache_creation_input_tokens,
                 usage.cache_read_input_tokens,
+                usage.provider_reported_cost_cents,
                 duration_ms,
             );
 
@@ -445,6 +453,7 @@ async fn handle_streaming(
 fn provider_from_name(provider_name: &str) -> providers::Provider {
     match provider_name {
         "openai" => providers::Provider::OpenAi,
+        "xai" => providers::Provider::Xai,
         "fireworks" => providers::Provider::Fireworks,
         "deepseek" => providers::Provider::DeepSeek,
         "google" => providers::Provider::Google,
@@ -552,6 +561,7 @@ fn spawn_post_request_tasks(
     output_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    provider_reported_cost_cents: Option<i64>,
     duration_ms: u64,
 ) {
     let event_id = uuid::Uuid::new_v4().to_string();
@@ -561,14 +571,16 @@ fn spawn_post_request_tasks(
     let org_id_owned = org_id.map(String::from);
     let project_id_owned = project_id.map(String::from);
     let agent_id_owned = agent_id.map(String::from);
-    let cost_cents = billing::cache_aware_cost_cents(
-        provider_name,
-        model,
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens,
-        cache_read_input_tokens,
-    );
+    let cost_cents = provider_reported_cost_cents.or_else(|| {
+        billing::cache_aware_cost_cents(
+            provider_name,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+        )
+    });
 
     // Debit z-billing (skip for public-guest — no billing account)
     if user_id != "public-guest" {
@@ -776,6 +788,7 @@ mod tests {
             )),
             anthropic_api_key,
             openai_api_key,
+            xai_api_key: None,
             fireworks_api_key,
             deepseek_api_key: None,
             google_api_key: None,
@@ -935,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_deepseek_provider_for_model_aware_credit_check() {
+    async fn uses_fireworks_provider_for_deepseek_v4_credit_check() {
         let cookie_secret = "test-cookie-secret";
         let jwt = test_jwt(cookie_secret, "user-deepseek-credit-check");
         let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
@@ -977,8 +990,55 @@ mod tests {
 
         let requests = recorded_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["provider"], "deepseek");
+        assert_eq!(requests[0]["provider"], "fireworks");
         assert_eq!(requests[0]["model"], "aura-deepseek-v4-flash");
+    }
+
+    #[tokio::test]
+    async fn uses_xai_provider_for_grok_credit_check() {
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-xai-credit-check");
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": false,
+            "balance_cents": 1,
+            "required_cents": 3,
+        }))
+        .await;
+
+        let app = router::create_router().with_state(test_state(
+            cookie_secret,
+            billing_url,
+            "unused".to_string(),
+            None,
+            None,
+        ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-grok-4-3",
+                    "max_tokens": 32,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "hello"}]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["provider"], "xai");
+        assert_eq!(requests[0]["model"], "aura-grok-4-3");
     }
 
     #[tokio::test]
@@ -1004,6 +1064,7 @@ mod tests {
             500_000,
             0,
             1_000_000,
+            None,
             123,
         );
 
@@ -1047,6 +1108,7 @@ mod tests {
             500_000,
             0,
             1_000_000,
+            None,
             123,
         );
 
@@ -1065,6 +1127,48 @@ mod tests {
         assert_eq!(requests[0]["metric"]["model"], "aura-gpt-5-5");
         assert_eq!(requests[0]["metric"]["input_tokens"], 1_000_000);
         assert_eq!(requests[0]["metric"]["output_tokens"], 500_000);
+    }
+
+    #[tokio::test]
+    async fn reports_provider_reported_usage_cost_to_billing() {
+        let cookie_secret = "test-cookie-secret";
+        let (billing_url, recorded_requests, _billing_handle) = start_recording_billing(json!({
+            "sufficient": true,
+            "balance_cents": 1_000_000,
+            "required_cents": 1,
+        }))
+        .await;
+        let state = test_state(cookie_secret, billing_url, "unused".to_string(), None, None);
+
+        super::spawn_post_request_tasks(
+            &state,
+            "user-xai-billing",
+            None,
+            None,
+            None,
+            "xai",
+            "aura-grok-4-3",
+            10,
+            2,
+            0,
+            0,
+            Some(3),
+            123,
+        );
+
+        for _ in 0..20 {
+            if !recorded_requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["user_id"], "user-xai-billing");
+        assert_eq!(requests[0]["cost_cents"], 3);
+        assert_eq!(requests[0]["metric"]["provider"], "xai");
+        assert_eq!(requests[0]["metric"]["model"], "aura-grok-4-3");
     }
 
     #[tokio::test]

@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         openai_api_key: std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
+        xai_api_key: std::env::var("XAI_API_KEY").ok().filter(|s| !s.is_empty()),
         fireworks_api_key: std::env::var("FIREWORKS_API_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -108,9 +109,7 @@ async fn main() -> anyhow::Result<()> {
         tripo_api_key: std::env::var("TRIPO_API_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
-        ark_api_key: std::env::var("ARK_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty()),
+        ark_api_key: std::env::var("ARK_API_KEY").ok().filter(|s| !s.is_empty()),
         z_billing_url,
         z_billing_api_key,
         aura_network_url: std::env::var("AURA_NETWORK_URL")
