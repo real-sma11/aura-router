@@ -113,6 +113,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "claude-sonnet-4-6",
             provider: Provider::Anthropic,
         }),
+        "aura-claude-sonnet-5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-sonnet-5",
+            provider: Provider::Anthropic,
+        }),
         "aura-claude-haiku-4-5" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "claude-haiku-4-5",

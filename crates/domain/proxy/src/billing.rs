@@ -183,7 +183,10 @@ fn anthropic_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 2500.0,
             input_tokens_is_new_only: true,
         }),
-        "claude-sonnet-4-6" | "aura-claude-sonnet-4-6" => Some(CacheAwareRates {
+        "claude-sonnet-4-6"
+        | "aura-claude-sonnet-4-6"
+        | "claude-sonnet-5"
+        | "aura-claude-sonnet-5" => Some(CacheAwareRates {
             new_input_cents_per_million: 300.0,
             cache_write_input_cents_per_million: 375.0,
             cache_read_input_cents_per_million: 30.0,
