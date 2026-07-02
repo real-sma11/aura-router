@@ -10,7 +10,7 @@ pub fn validate_request(provider: Provider, request: &Value) -> Result<(), Strin
         // validates (text/image/tool_result/tool_use) and uses
         // `reasoning_effort` rather than Anthropic `thinking`, so the shared
         // validator applies.
-        Provider::OpenAi | Provider::DeepSeek | Provider::Google => {
+        Provider::OpenAi | Provider::Xai | Provider::DeepSeek | Provider::Google => {
             validate_openai_request(request)
         }
         Provider::Fireworks => {
@@ -38,7 +38,7 @@ pub fn request_to_upstream(
             }
             Ok(next)
         }
-        Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
+        Provider::OpenAi | Provider::Xai | Provider::Fireworks | Provider::DeepSeek => {
             validate_openai_request(request)?;
             let mut upstream = anthropic_request_to_openai(request, upstream_model)?;
             apply_reasoning_effort(provider, request, &mut upstream);
@@ -59,6 +59,8 @@ pub fn request_to_upstream(
 /// here, clamped to the values the target provider accepts:
 /// - OpenAI accepts `minimal`/`low`/`medium`/`high` (no `max`/`xhigh`,
 ///   which fold to `high`).
+/// - xAI accepts `none`/`low`/`medium`/`high`; Aura's `minimal` maps to
+///   `none`, while larger unsupported tiers fold to `high`.
 /// - Fireworks open-weight models (e.g. GPT-OSS) accept
 ///   `low`/`medium`/`high` (`minimal` folds to `low`).
 /// - DeepSeek has no discrete effort knob, so the hint is dropped.
@@ -68,6 +70,13 @@ fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Va
     };
     let mapped = match provider {
         Provider::OpenAi => openai_reasoning_effort(tier),
+        Provider::Xai => match tier.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "none" => Some("none"),
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
+        },
         Provider::Fireworks => match tier.trim().to_ascii_lowercase().as_str() {
             "minimal" | "low" => Some("low"),
             "medium" => Some("medium"),
@@ -112,6 +121,14 @@ fn openai_reasoning_effort(tier: &str) -> Option<&'static str> {
 /// actually requested an effort tier, so non-reasoning models such as
 /// gpt-4.1 are not handed an invalid `reasoning` param).
 pub fn anthropic_request_to_openai_responses(
+    request: &Value,
+    upstream_model: &str,
+) -> Result<Value, String> {
+    anthropic_request_to_responses(Provider::OpenAi, request, upstream_model)
+}
+
+pub fn anthropic_request_to_responses(
+    provider: Provider,
     request: &Value,
     upstream_model: &str,
 ) -> Result<Value, String> {
@@ -165,22 +182,9 @@ pub fn anthropic_request_to_openai_responses(
         upstream["stream"] = Value::Bool(true);
     }
 
-    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
-        if !tools.is_empty() {
-            upstream["tools"] = Value::Array(
-                tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
-                            "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
-                            "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
-                        })
-                    })
-                    .collect(),
-            );
-        }
+    let response_tools = responses_tools(provider, request)?;
+    if !response_tools.is_empty() {
+        upstream["tools"] = Value::Array(response_tools);
     }
 
     if let Some(tool_choice) = request.get("tool_choice").and_then(Value::as_object) {
@@ -202,12 +206,128 @@ pub fn anthropic_request_to_openai_responses(
     }
 
     if let Some(tier) = request.get("reasoning_effort").and_then(Value::as_str) {
-        if let Some(effort) = openai_reasoning_effort(tier) {
+        if let Some(effort) = responses_reasoning_effort(provider, tier) {
             upstream["reasoning"] = json!({ "effort": effort });
         }
     }
 
     Ok(upstream)
+}
+
+fn responses_reasoning_effort(provider: Provider, tier: &str) -> Option<&'static str> {
+    match provider {
+        Provider::Xai => match tier.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "none" => Some("none"),
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" | "xhigh" | "max" => Some("high"),
+            _ => None,
+        },
+        _ => openai_reasoning_effort(tier),
+    }
+}
+
+fn responses_tools(provider: Provider, request: &Value) -> Result<Vec<Value>, String> {
+    let mut tools = Vec::new();
+
+    if let Some(request_tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in request_tools {
+            if provider == Provider::Xai && is_xai_server_tool(tool) {
+                tools.push(tool.clone());
+            } else {
+                tools.push(json!({
+                    "type": "function",
+                    "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                    "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+                }));
+            }
+        }
+    }
+
+    if provider == Provider::Xai {
+        for key in ["xai_tools", "server_tools"] {
+            if let Some(server_tools) = request.get(key).and_then(Value::as_array) {
+                for tool in server_tools {
+                    if !is_xai_server_tool(tool) {
+                        return Err(format!(
+                            "xAI server-side tool entries in `{key}` require a supported `type`."
+                        ));
+                    }
+                    tools.push(tool.clone());
+                }
+            }
+        }
+        if let Some(mcp_servers) = request.get("xai_mcp_servers").and_then(Value::as_array) {
+            for server in mcp_servers {
+                tools.push(xai_mcp_server_tool(server)?);
+            }
+        }
+    }
+
+    Ok(tools)
+}
+
+fn is_xai_server_tool(tool: &Value) -> bool {
+    matches!(
+        tool.get("type").and_then(Value::as_str),
+        Some(
+            "mcp"
+                | "web_search"
+                | "x_search"
+                | "code_execution"
+                | "code_interpreter"
+                | "file_search"
+                | "attachment_search"
+                | "collections_search"
+        )
+    )
+}
+
+fn xai_mcp_server_tool(server: &Value) -> Result<Value, String> {
+    let object = server
+        .as_object()
+        .ok_or_else(|| "`xai_mcp_servers` entries must be objects.".to_string())?;
+    let server_url = object
+        .get("server_url")
+        .or_else(|| object.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "`xai_mcp_servers` entries require `server_url`.".to_string())?;
+    let server_label = object
+        .get("server_label")
+        .or_else(|| object.get("label"))
+        .or_else(|| object.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "`xai_mcp_servers` entries require `server_label`.".to_string())?;
+
+    let mut tool = serde_json::Map::new();
+    tool.insert("type".to_string(), Value::String("mcp".to_string()));
+    tool.insert(
+        "server_url".to_string(),
+        Value::String(server_url.to_string()),
+    );
+    tool.insert(
+        "server_label".to_string(),
+        Value::String(server_label.to_string()),
+    );
+    for key in ["server_description", "authorization", "headers"] {
+        if let Some(value) = object.get(key) {
+            tool.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(allowed_tools) = object
+        .get("allowed_tools")
+        .or_else(|| object.get("allowedTools"))
+        .cloned()
+    {
+        tool.insert("allowed_tools".to_string(), allowed_tools);
+    }
+
+    Ok(Value::Object(tool))
 }
 
 fn append_responses_user_items(blocks: &[Value], input: &mut Vec<Value>) {
@@ -412,7 +532,7 @@ pub fn response_from_upstream(
             next["model"] = Value::String(requested_model.to_string());
             Ok(next)
         }
-        Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
+        Provider::OpenAi | Provider::Xai | Provider::Fireworks | Provider::DeepSeek => {
             openai_response_to_anthropic(response, requested_model)
         }
         Provider::Google => google_compat::response_from_gemini(requested_model, response),
@@ -1002,9 +1122,9 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        anthropic_request_to_openai_responses, extract_last_user_text, extract_response_text,
-        openai_responses_to_anthropic, request_to_upstream, response_from_upstream,
-        validate_request,
+        anthropic_request_to_openai_responses, anthropic_request_to_responses,
+        extract_last_user_text, extract_response_text, openai_responses_to_anthropic,
+        request_to_upstream, response_from_upstream, validate_request,
     };
     use crate::providers::Provider;
     use serde_json::{json, Value};
@@ -1033,6 +1153,35 @@ mod tests {
         });
         let upstream =
             request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("high".to_string())
+        );
+    }
+
+    #[test]
+    fn translates_reasoning_effort_to_xai_native() {
+        let request = json!({
+            "model": "aura-grok-4-3",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "minimal"
+        });
+        let upstream =
+            request_to_upstream(Provider::Xai, "grok-4.3", &request).expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("none".to_string())
+        );
+
+        let request = json!({
+            "model": "aura-grok-4-3",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "max"
+        });
+        let upstream =
+            request_to_upstream(Provider::Xai, "grok-4.3", &request).expect("translation");
         assert_eq!(
             upstream["reasoning_effort"],
             Value::String("high".to_string())
@@ -1161,6 +1310,37 @@ mod tests {
             upstream.get("reasoning").is_none(),
             "non-reasoning model with tools must not receive a reasoning param: {upstream}"
         );
+    }
+
+    #[test]
+    fn xai_responses_request_maps_reasoning_and_remote_mcp_tools() {
+        let request = json!({
+            "model": "aura-grok-4-3",
+            "max_tokens": 512,
+            "reasoning_effort": "minimal",
+            "xai_mcp_servers": [{
+                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "deepwiki",
+                "server_description": "Docs search",
+                "allowed_tools": ["ask_question"]
+            }],
+            "xai_tools": [{
+                "type": "web_search"
+            }],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let upstream = anthropic_request_to_responses(Provider::Xai, &request, "grok-4.3")
+            .expect("xai responses translation");
+
+        assert_eq!(upstream["model"], "grok-4.3");
+        assert_eq!(upstream["reasoning"]["effort"], "none");
+        assert_eq!(upstream["tools"][0]["type"], "web_search");
+        assert_eq!(upstream["tools"][1]["type"], "mcp");
+        assert_eq!(
+            upstream["tools"][1]["server_url"],
+            "https://mcp.deepwiki.com/mcp"
+        );
+        assert_eq!(upstream["tools"][1]["allowed_tools"][0], "ask_question");
     }
 
     #[test]

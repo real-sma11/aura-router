@@ -33,6 +33,21 @@ pub struct LlmMetric {
 }
 
 const DEFAULT_LLM_MARKUP_MULTIPLIER: f64 = 1.20;
+const USD_TICKS_PER_CENT: f64 = 100_000_000.0;
+
+/// Convert provider-reported USD ticks into marked-up billing cents.
+///
+/// xAI reports exact request cost in `usage.cost_in_usd_ticks` where
+/// 10,000,000,000 ticks = $1. Convert that to cents and apply the same LLM
+/// markup used by model-table estimates.
+pub fn marked_up_cost_cents_from_usd_ticks(ticks: u64) -> Option<i64> {
+    if ticks == 0 {
+        return None;
+    }
+    let cents = ticks as f64 / USD_TICKS_PER_CENT * DEFAULT_LLM_MARKUP_MULTIPLIER;
+    let rounded = cents.round() as i64;
+    Some(rounded.max(1))
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CacheAwareRates {
@@ -96,8 +111,38 @@ fn cache_aware_rates(provider: &str, model: &str) -> Option<CacheAwareRates> {
         "anthropic" => anthropic_rates(model),
         "deepseek" => deepseek_rates(model),
         "openai" => openai_rates(model),
+        "xai" => xai_rates(model),
         "fireworks" => fireworks_rates(model),
         "google" => google_rates(model),
+        _ => None,
+    }
+}
+
+/// Per-model rates for xAI Grok chat models (cents per million tokens).
+///
+/// xAI publishes a discounted cached-input rate for Grok. It does not
+/// publish a separate cache-write rate for these models, so cache writes use
+/// the base input rate when reported.
+fn xai_rates(model: &str) -> Option<CacheAwareRates> {
+    let model = model
+        .strip_prefix("xai/")
+        .or_else(|| model.strip_prefix("grok/"))
+        .unwrap_or(model);
+    match model {
+        "aura-grok-4-3" | "grok-4.3" => Some(CacheAwareRates {
+            new_input_cents_per_million: 125.0,
+            cache_write_input_cents_per_million: 125.0,
+            cache_read_input_cents_per_million: 20.0,
+            output_cents_per_million: 250.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-grok-build-0-1" | "grok-build-0.1" => Some(CacheAwareRates {
+            new_input_cents_per_million: 100.0,
+            cache_write_input_cents_per_million: 100.0,
+            cache_read_input_cents_per_million: 20.0,
+            output_cents_per_million: 200.0,
+            input_tokens_is_new_only: false,
+        }),
         _ => None,
     }
 }
@@ -541,7 +586,7 @@ pub async fn report_usage(
 
 #[cfg(test)]
 mod tests {
-    use super::cache_aware_cost_cents;
+    use super::{cache_aware_cost_cents, marked_up_cost_cents_from_usd_ticks};
 
     #[test]
     fn deepseek_cache_aware_cost_uses_cache_buckets_and_markup() {
@@ -614,17 +659,73 @@ mod tests {
     }
 
     #[test]
+    fn xai_grok_cache_aware_cost_discounts_cached_tokens() {
+        // grok-4.3: new 0, cache_read 1M x 20, output 500k x 250.
+        // (20_000_000 + 125_000_000) x 1.2 / 1M = 174
+        assert_eq!(
+            cache_aware_cost_cents("xai", "aura-grok-4-3", 1_000_000, 500_000, 0, 1_000_000),
+            Some(174)
+        );
+        assert_eq!(
+            cache_aware_cost_cents(
+                "xai",
+                "xai/grok-build-0.1",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000
+            ),
+            cache_aware_cost_cents(
+                "xai",
+                "aura-grok-build-0-1",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000
+            ),
+        );
+    }
+
+    #[test]
+    fn provider_reported_usd_ticks_convert_to_marked_up_cents() {
+        assert_eq!(marked_up_cost_cents_from_usd_ticks(250_000_000), Some(3));
+        assert_eq!(marked_up_cost_cents_from_usd_ticks(1), Some(1));
+        assert_eq!(marked_up_cost_cents_from_usd_ticks(0), None);
+    }
+
+    #[test]
     fn google_gemini_cache_aware_cost_discounts_cached_tokens() {
         // gemini-2.5-pro: new 0, cache_read 1M × 12.5, output 500k × 1000.
         // (12_500_000 + 500_000_000) × 1.2 / 1M = 615
         assert_eq!(
-            cache_aware_cost_cents("google", "aura-gemini-2-5-pro", 1_000_000, 500_000, 0, 1_000_000),
+            cache_aware_cost_cents(
+                "google",
+                "aura-gemini-2-5-pro",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000
+            ),
             Some(615)
         );
         // Raw upstream name resolves to the same rate table.
         assert_eq!(
-            cache_aware_cost_cents("google", "gemini-2.5-flash", 1_000_000, 500_000, 0, 1_000_000),
-            cache_aware_cost_cents("google", "aura-gemini-2-5-flash", 1_000_000, 500_000, 0, 1_000_000),
+            cache_aware_cost_cents(
+                "google",
+                "gemini-2.5-flash",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000
+            ),
+            cache_aware_cost_cents(
+                "google",
+                "aura-gemini-2-5-flash",
+                1_000_000,
+                500_000,
+                0,
+                1_000_000
+            ),
         );
     }
 
@@ -823,7 +924,10 @@ mod tests {
     fn new_fireworks_models_aura_aliases_resolve_to_same_rates() {
         for (alias, upstream) in [
             ("aura-minimax-m3", "accounts/fireworks/models/minimax-m3"),
-            ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
+            (
+                "aura-minimax-m2-7",
+                "accounts/fireworks/models/minimax-m2p7",
+            ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),

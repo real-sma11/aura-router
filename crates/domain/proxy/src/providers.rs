@@ -12,6 +12,7 @@ const COMPUTER_USE_BETA: &str = "computer-use-2025-01-24";
 pub enum Provider {
     Anthropic,
     OpenAi,
+    Xai,
     Fireworks,
     DeepSeek,
     Google,
@@ -23,6 +24,7 @@ impl Provider {
         match self {
             Provider::Anthropic => "anthropic",
             Provider::OpenAi => "openai",
+            Provider::Xai => "xai",
             Provider::Fireworks => "fireworks",
             Provider::DeepSeek => "deepseek",
             Provider::Google => "google",
@@ -51,6 +53,8 @@ pub enum Maker {
     OpenAi,
     /// Google (Gemini, Gemma).
     Google,
+    /// xAI (Grok).
+    Xai,
     /// DeepSeek AI.
     DeepSeek,
     /// Moonshot AI (Kimi).
@@ -70,6 +74,7 @@ impl Maker {
             Maker::Anthropic => "Anthropic",
             Maker::OpenAi => "OpenAI",
             Maker::Google => "Google",
+            Maker::Xai => "xAI",
             Maker::DeepSeek => "DeepSeek AI",
             Maker::Moonshot => "Moonshot AI",
             Maker::MiniMax => "MiniMax",
@@ -157,6 +162,26 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             requested_model: model,
             upstream_model: "o4-mini",
             provider: Provider::OpenAi,
+        }),
+        "aura-grok-4-3" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "grok-4.3",
+            provider: Provider::Xai,
+        }),
+        "aura-grok-build-0-1" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "grok-build-0.1",
+            provider: Provider::Xai,
+        }),
+        "xai/grok-4.3" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "grok-4.3",
+            provider: Provider::Xai,
+        }),
+        "xai/grok-build-0.1" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "grok-build-0.1",
+            provider: Provider::Xai,
         }),
         // DeepSeek V4 models are served via Fireworks (which hosts them
         // verbatim) rather than DeepSeek's first-party API, so they reuse the
@@ -291,6 +316,8 @@ fn infer_provider(model: &str) -> Option<Provider> {
         || model.starts_with("codex")
     {
         Some(Provider::OpenAi)
+    } else if model.starts_with("grok") {
+        Some(Provider::Xai)
     } else if model.starts_with("deepseek-v4")
         || model == "deepseek-chat"
         || model == "deepseek-reasoner"
@@ -347,6 +374,8 @@ pub fn model_maker(model: &str) -> Option<Maker> {
         Maker::OpenAi
     } else if name.contains("gemini") || name.contains("gemma") {
         Maker::Google
+    } else if name.contains("grok") {
+        Maker::Xai
     } else if name.contains("deepseek") {
         Maker::DeepSeek
     } else if name.contains("kimi") {
@@ -376,25 +405,37 @@ pub enum OpenAiApi {
     Responses,
 }
 
-/// Decide which OpenAI surface an inbound `/v1/messages` request maps to.
+/// Decide which OpenAI-compatible surface an inbound `/v1/messages` request
+/// maps to.
 ///
-/// Returns [`OpenAiApi::Responses`] only for OpenAI requests that carry a
-/// non-empty `tools` array; everything else (including all non-OpenAI
-/// providers, for which the value is ignored) reports
-/// [`OpenAiApi::ChatCompletions`].
+/// OpenAI and xAI both expose a Responses API. For OpenAI we use it when
+/// Anthropic function tools are present. For xAI we use it for any tool
+/// surface, including native server-side tools and Remote MCP servers, since
+/// those are documented on the xAI Responses path.
 pub fn openai_api_for_request(provider: Provider, request: &Value) -> OpenAiApi {
-    if provider != Provider::OpenAi {
-        return OpenAiApi::ChatCompletions;
-    }
     let has_tools = request
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty());
-    if has_tools {
-        OpenAiApi::Responses
-    } else {
-        OpenAiApi::ChatCompletions
+    match provider {
+        Provider::OpenAi if has_tools => OpenAiApi::Responses,
+        Provider::Xai
+            if has_tools
+                || has_non_empty_array(request, "xai_tools")
+                || has_non_empty_array(request, "server_tools")
+                || has_non_empty_array(request, "xai_mcp_servers") =>
+        {
+            OpenAiApi::Responses
+        }
+        _ => OpenAiApi::ChatCompletions,
     }
+}
+
+fn has_non_empty_array(request: &Value, key: &str) -> bool {
+    request
+        .get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.is_empty())
 }
 
 /// Get the base URL for a provider's messages endpoint.
@@ -406,6 +447,7 @@ pub fn provider_url(provider: &Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "https://api.anthropic.com/v1/messages",
         Provider::OpenAi => "https://api.openai.com/v1/chat/completions",
+        Provider::Xai => "https://api.x.ai/v1/chat/completions",
         // Intentionally use the stateless chat completions path for Aura's OSS lane.
         // Aura Router centrally avoids Fireworks surfaces that can retain conversation state.
         Provider::Fireworks => "https://api.fireworks.ai/inference/v1/chat/completions",
@@ -439,6 +481,14 @@ pub fn openai_endpoint_url(api: OpenAiApi) -> &'static str {
     }
 }
 
+/// Get the xAI endpoint URL for the given OpenAI-compatible API surface.
+pub fn xai_endpoint_url(api: OpenAiApi) -> &'static str {
+    match api {
+        OpenAiApi::ChatCompletions => "https://api.x.ai/v1/chat/completions",
+        OpenAiApi::Responses => "https://api.x.ai/v1/responses",
+    }
+}
+
 /// Get the maximum context window size for a model (in tokens).
 pub fn max_context_tokens(model: &str) -> u64 {
     let resolved_model = resolve_model(model)
@@ -458,6 +508,9 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "gpt-5.4" => 1_050_000,
         "gpt-5.4-mini" => 400_000,
         "gpt-5.4-nano" => 400_000,
+        // xAI
+        "grok-4.3" => 1_000_000,
+        "grok-build-0.1" => 256_000,
         m if m.starts_with("gpt-4o") => 128_000,
         m if m.starts_with("gpt-4-turbo") => 128_000,
         m if m.starts_with("gpt-4") => 8_192,
@@ -502,7 +555,7 @@ pub fn provider_headers(provider: &Provider, api_key: &str) -> Option<HeaderMap>
                 HeaderValue::from_static(PROMPT_CACHING_BETA),
             );
         }
-        Provider::OpenAi | Provider::DeepSeek => {
+        Provider::OpenAi | Provider::Xai | Provider::DeepSeek => {
             headers.insert(
                 "authorization",
                 HeaderValue::from_str(&format!("Bearer {api_key}")).ok()?,
@@ -549,7 +602,7 @@ pub fn merge_anthropic_beta_header(headers: &mut HeaderMap, inbound_beta: &str) 
 mod tests {
     use super::{
         merge_anthropic_beta_header, model_maker, openai_api_for_request, openai_endpoint_url,
-        provider_headers, resolve_model, resolve_provider, OpenAiApi, Provider,
+        provider_headers, resolve_model, resolve_provider, xai_endpoint_url, OpenAiApi, Provider,
     };
     use serde_json::json;
 
@@ -606,7 +659,50 @@ mod tests {
     }
 
     #[test]
-    fn non_openai_providers_never_select_responses_api() {
+    fn xai_headers_use_bearer_auth() {
+        let headers = provider_headers(&Provider::Xai, "xai-test-key").expect("valid headers");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer xai-test-key")
+        );
+        assert_eq!(
+            super::provider_url(&Provider::Xai),
+            "https://api.x.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            xai_endpoint_url(OpenAiApi::Responses),
+            "https://api.x.ai/v1/responses"
+        );
+    }
+
+    #[test]
+    fn xai_tool_requests_route_to_responses_api() {
+        let function_tools = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "name": "search", "input_schema": {} }],
+        });
+        assert_eq!(
+            openai_api_for_request(Provider::Xai, &function_tools),
+            OpenAiApi::Responses
+        );
+
+        let remote_mcp = json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "xai_mcp_servers": [{
+                "server_url": "https://mcp.deepwiki.com/mcp",
+                "server_label": "deepwiki"
+            }],
+        });
+        assert_eq!(
+            openai_api_for_request(Provider::Xai, &remote_mcp),
+            OpenAiApi::Responses
+        );
+    }
+
+    #[test]
+    fn other_non_openai_providers_never_select_responses_api() {
         let request = json!({
             "messages": [{ "role": "user", "content": "hi" }],
             "tools": [{ "name": "search", "input_schema": {} }],
@@ -654,6 +750,8 @@ mod tests {
             ("aura-claude-opus-4-8", "Anthropic"),
             ("aura-gpt-5-5", "OpenAI"),
             ("aura-oss-120b", "OpenAI"),
+            ("aura-grok-4-3", "xAI"),
+            ("xai/grok-build-0.1", "xAI"),
             ("aura-gemini-3-1-pro", "Google"),
             ("aura-deepseek-v4-pro", "DeepSeek AI"),
             ("deepseek/deepseek-v4-flash", "DeepSeek AI"),
@@ -677,6 +775,8 @@ mod tests {
     fn resolve_provider_understands_aura_aliases() {
         assert_eq!(resolve_provider("aura-gpt-5-5"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-gpt-5-4"), Some(Provider::OpenAi));
+        assert_eq!(resolve_provider("aura-grok-4-3"), Some(Provider::Xai));
+        assert_eq!(resolve_provider("aura-grok-build-0-1"), Some(Provider::Xai));
         assert_eq!(
             resolve_provider("aura-kimi-k2-5"),
             Some(Provider::Fireworks)
@@ -729,7 +829,10 @@ mod tests {
     fn resolves_new_fireworks_models() {
         for (alias, upstream) in [
             ("aura-minimax-m3", "accounts/fireworks/models/minimax-m3"),
-            ("aura-minimax-m2-7", "accounts/fireworks/models/minimax-m2p7"),
+            (
+                "aura-minimax-m2-7",
+                "accounts/fireworks/models/minimax-m2p7",
+            ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
             ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
@@ -748,6 +851,25 @@ mod tests {
         assert_eq!(resolved.requested_model, "gpt-5.5");
         assert_eq!(resolved.upstream_model, "gpt-5.5");
         assert_eq!(resolved.provider, Provider::OpenAi);
+    }
+
+    #[test]
+    fn resolves_grok_aliases_to_xai() {
+        for (alias, upstream, context) in [
+            ("aura-grok-4-3", "grok-4.3", 1_000_000),
+            ("xai/grok-4.3", "grok-4.3", 1_000_000),
+            ("aura-grok-build-0-1", "grok-build-0.1", 256_000),
+            ("xai/grok-build-0.1", "grok-build-0.1", 256_000),
+        ] {
+            let resolved = resolve_model(alias).expect("grok alias should resolve");
+            assert_eq!(resolved.upstream_model, upstream);
+            assert_eq!(resolved.provider, Provider::Xai);
+            assert_eq!(super::max_context_tokens(alias), context);
+        }
+
+        let raw = resolve_model("grok-4.3").expect("raw grok model should resolve");
+        assert_eq!(raw.upstream_model, "grok-4.3");
+        assert_eq!(raw.provider, Provider::Xai);
     }
 
     #[test]

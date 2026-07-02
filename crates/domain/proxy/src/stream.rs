@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::providers::{self, OpenAiApi, Provider};
+use crate::{
+    billing,
+    providers::{self, OpenAiApi, Provider},
+};
 
 /// Token usage extracted from an SSE stream.
 #[derive(Debug, Default)]
@@ -20,6 +23,7 @@ pub struct StreamUsage {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    pub provider_reported_cost_cents: Option<i64>,
     pub model: Option<String>,
 }
 
@@ -143,10 +147,10 @@ impl StreamAdapter {
             Provider::Anthropic => Self::Anthropic(AnthropicPassthrough {
                 parser: SseParser::new(),
             }),
-            Provider::OpenAi if api == OpenAiApi::Responses => {
+            Provider::OpenAi | Provider::Xai if api == OpenAiApi::Responses => {
                 Self::OpenAiResponses(OpenAiResponsesStream::new(requested_model))
             }
-            Provider::OpenAi | Provider::Fireworks | Provider::DeepSeek => {
+            Provider::OpenAi | Provider::Xai | Provider::Fireworks | Provider::DeepSeek => {
                 Self::OpenAi(OpenAiCompatStream::new(requested_model))
             }
             Provider::Google => Self::Google(GoogleStream::new(requested_model)),
@@ -247,6 +251,7 @@ impl OpenAiCompatStream {
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            provider_reported_cost_cents: self.usage.provider_reported_cost_cents,
             model: self.usage.model.clone(),
         }
     }
@@ -324,6 +329,13 @@ impl OpenAiCompatStream {
                 })
                 .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
                 .unwrap_or(self.usage.cache_read_input_tokens);
+            if let Some(cost_cents) = usage
+                .get("cost_in_usd_ticks")
+                .and_then(Value::as_u64)
+                .and_then(billing::marked_up_cost_cents_from_usd_ticks)
+            {
+                self.usage.provider_reported_cost_cents = Some(cost_cents);
+            }
             if self.pending_stop_reason.is_some() {
                 self.finish_message(output);
             }
@@ -648,6 +660,7 @@ impl OpenAiResponsesStream {
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            provider_reported_cost_cents: self.usage.provider_reported_cost_cents,
             model: self.usage.model.clone(),
         }
     }
@@ -901,6 +914,13 @@ impl OpenAiResponsesStream {
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(self.usage.cache_read_input_tokens);
+            if let Some(cost_cents) = usage
+                .get("cost_in_usd_ticks")
+                .and_then(Value::as_u64)
+                .and_then(billing::marked_up_cost_cents_from_usd_ticks)
+            {
+                self.usage.provider_reported_cost_cents = Some(cost_cents);
+            }
         }
         if event
             .pointer("/response/incomplete_details/reason")
@@ -1055,6 +1075,7 @@ impl GoogleStream {
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            provider_reported_cost_cents: self.usage.provider_reported_cost_cents,
             model: self.usage.model.clone(),
         }
     }
@@ -1193,7 +1214,10 @@ impl GoogleStream {
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let args = function_call.get("args").cloned().unwrap_or_else(|| json!({}));
+        let args = function_call
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
 
         output.push_back(anthropic_sse(
             "content_block_start",
@@ -1351,6 +1375,7 @@ impl SseParser {
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            provider_reported_cost_cents: self.usage.provider_reported_cost_cents,
             model: self.usage.model.clone(),
         }
     }
@@ -1476,7 +1501,7 @@ mod tests {
             "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\"}\n\n",
             "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"\\\"aura\\\"}\"}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"search_repo\"}}\n\n",
-            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4},\"cost_in_usd_ticks\":250000000}}}\n\n",
         ]);
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
@@ -1527,6 +1552,41 @@ mod tests {
         assert_eq!(usage.input_tokens, 21);
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cache_read_input_tokens, 4);
+        assert_eq!(usage.provider_reported_cost_cents, Some(3));
+    }
+
+    #[tokio::test]
+    async fn xai_responses_stream_uses_responses_adapter() {
+        let stream = bytes_stream(vec![
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_xai\",\"model\":\"grok-4.3\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"delta\":\"Grok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_xai\",\"model\":\"grok-4.3\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cost_in_usd_ticks\":100000000}}}\n\n",
+        ]);
+        let (tx, rx) = oneshot::channel();
+        let mut tee = TeeStream {
+            inner: Box::pin(stream),
+            adapter: StreamAdapter::new(Provider::Xai, OpenAiApi::Responses, "aura-grok-4-3"),
+            usage_tx: Some(tx),
+            finished: false,
+            pending_output: VecDeque::new(),
+        };
+
+        let mut emitted = Vec::new();
+        while let Some(chunk) = tee.next().await {
+            emitted.push(String::from_utf8_lossy(&chunk.unwrap()).to_string());
+        }
+        let joined = emitted.join("");
+        assert!(
+            joined.contains("message_start"),
+            "missing message_start: {joined}"
+        );
+        assert!(joined.contains("Grok"), "missing text delta: {joined}");
+
+        let usage = rx.await.unwrap();
+        assert_eq!(usage.model.as_deref(), Some("grok-4.3"));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.provider_reported_cost_cents, Some(1));
     }
 
     #[tokio::test]
