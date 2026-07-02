@@ -228,7 +228,10 @@ fn anthropic_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 2500.0,
             input_tokens_is_new_only: true,
         }),
-        "claude-sonnet-4-6" | "aura-claude-sonnet-4-6" => Some(CacheAwareRates {
+        "claude-sonnet-4-6"
+        | "aura-claude-sonnet-4-6"
+        | "claude-sonnet-5"
+        | "aura-claude-sonnet-5" => Some(CacheAwareRates {
             new_input_cents_per_million: 300.0,
             cache_write_input_cents_per_million: 375.0,
             cache_read_input_cents_per_million: 30.0,
@@ -337,6 +340,17 @@ fn fireworks_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 400.0,
             input_tokens_is_new_only: false,
         }),
+        // Kimi K2.7 Code — Moonshot's coding variant. Input/output match
+        // K2.6's published rates; the cache-hit rate is its own $0.19/1M.
+        "aura-kimi-k2-7-code" | "accounts/fireworks/models/kimi-k2p7-code" => {
+            Some(CacheAwareRates {
+                new_input_cents_per_million: 95.0,
+                cache_write_input_cents_per_million: 95.0,
+                cache_read_input_cents_per_million: 19.0,
+                output_cents_per_million: 400.0,
+                input_tokens_is_new_only: false,
+            })
+        }
         "accounts/fireworks/models/kimi-k2p6-turbo"
         | "accounts/fireworks/routers/kimi-k2p6-turbo" => Some(CacheAwareRates {
             new_input_cents_per_million: 200.0,
@@ -402,11 +416,25 @@ fn fireworks_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 440.0,
             input_tokens_is_new_only: false,
         }),
+        "aura-glm-5-2" | "accounts/fireworks/models/glm-5p2" => Some(CacheAwareRates {
+            new_input_cents_per_million: 140.0,
+            cache_write_input_cents_per_million: 140.0,
+            cache_read_input_cents_per_million: 26.0,
+            output_cents_per_million: 440.0,
+            input_tokens_is_new_only: false,
+        }),
         "aura-qwen3-6-plus" | "accounts/fireworks/models/qwen3p6-plus" => Some(CacheAwareRates {
             new_input_cents_per_million: 50.0,
             cache_write_input_cents_per_million: 50.0,
             cache_read_input_cents_per_million: 10.0,
             output_cents_per_million: 300.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-qwen3-7-plus" | "accounts/fireworks/models/qwen3p7-plus" => Some(CacheAwareRates {
+            new_input_cents_per_million: 40.0,
+            cache_write_input_cents_per_million: 40.0,
+            cache_read_input_cents_per_million: 8.0,
+            output_cents_per_million: 160.0,
             input_tokens_is_new_only: false,
         }),
         _ => None,
@@ -901,10 +929,10 @@ mod tests {
                 "accounts/fireworks/models/minimax-m2p7",
             ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
-            (
-                "aura-qwen3-6-plus",
-                "accounts/fireworks/models/qwen3p6-plus",
-            ),
+            ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
+            ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
+            ("aura-qwen3-7-plus", "accounts/fireworks/models/qwen3p7-plus"),
+            ("aura-kimi-k2-7-code", "accounts/fireworks/models/kimi-k2p7-code"),
         ] {
             let via_alias =
                 cache_aware_cost_cents("fireworks", alias, 1_000_000, 500_000, 0, 200_000);

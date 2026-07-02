@@ -118,6 +118,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "claude-sonnet-4-6",
             provider: Provider::Anthropic,
         }),
+        "aura-claude-sonnet-5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "claude-sonnet-5",
+            provider: Provider::Anthropic,
+        }),
         "aura-claude-haiku-4-5" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "claude-haiku-4-5",
@@ -212,6 +217,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/kimi-k2p6",
             provider: Provider::Fireworks,
         }),
+        "aura-kimi-k2-7-code" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/kimi-k2p7-code",
+            provider: Provider::Fireworks,
+        }),
         "aura-oss-120b" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "accounts/fireworks/models/gpt-oss-120b",
@@ -237,9 +247,19 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "accounts/fireworks/models/glm-5p1",
             provider: Provider::Fireworks,
         }),
+        "aura-glm-5-2" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/glm-5p2",
+            provider: Provider::Fireworks,
+        }),
         "aura-qwen3-6-plus" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "accounts/fireworks/models/qwen3p6-plus",
+            provider: Provider::Fireworks,
+        }),
+        "aura-qwen3-7-plus" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "accounts/fireworks/models/qwen3p7-plus",
             provider: Provider::Fireworks,
         }),
         // Google Gemini chat models route directly through the Google
@@ -814,10 +834,10 @@ mod tests {
                 "accounts/fireworks/models/minimax-m2p7",
             ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
-            (
-                "aura-qwen3-6-plus",
-                "accounts/fireworks/models/qwen3p6-plus",
-            ),
+            ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
+            ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
+            ("aura-qwen3-7-plus", "accounts/fireworks/models/qwen3p7-plus"),
+            ("aura-kimi-k2-7-code", "accounts/fireworks/models/kimi-k2p7-code"),
         ] {
             let resolved = resolve_model(alias).expect("aura alias should resolve");
             assert_eq!(resolved.upstream_model, upstream);
