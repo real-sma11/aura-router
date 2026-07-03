@@ -41,7 +41,7 @@ pub fn request_to_upstream(
         Provider::OpenAi | Provider::Xai | Provider::Fireworks | Provider::DeepSeek => {
             validate_openai_request(request)?;
             let mut upstream = anthropic_request_to_openai(request, upstream_model)?;
-            apply_reasoning_effort(provider, request, &mut upstream);
+            apply_reasoning_effort(provider, upstream_model, request, &mut upstream);
             Ok(upstream)
         }
         Provider::Google => {
@@ -59,24 +59,26 @@ pub fn request_to_upstream(
 /// here, clamped to the values the target provider accepts:
 /// - OpenAI accepts `minimal`/`low`/`medium`/`high` (no `max`/`xhigh`,
 ///   which fold to `high`).
-/// - xAI accepts `none`/`low`/`medium`/`high`; Aura's `minimal` maps to
-///   `none`, while larger unsupported tiers fold to `high`.
+/// - xAI Grok reasoning models accept `none`/`low`/`medium`/`high`; Aura's
+///   `minimal` maps to `none`, while larger unsupported tiers fold to `high`.
 /// - Fireworks open-weight models (e.g. GPT-OSS) accept
 ///   `low`/`medium`/`high` (`minimal` folds to `low`).
 /// - DeepSeek has no discrete effort knob, so the hint is dropped.
-fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Value) {
+fn apply_reasoning_effort(
+    provider: Provider,
+    upstream_model: &str,
+    request: &Value,
+    upstream: &mut Value,
+) {
     let Some(tier) = request.get("reasoning_effort").and_then(Value::as_str) else {
         return;
     };
     let mapped = match provider {
         Provider::OpenAi => openai_reasoning_effort(tier),
-        Provider::Xai => match tier.trim().to_ascii_lowercase().as_str() {
-            "minimal" | "none" => Some("none"),
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" | "xhigh" | "max" => Some("high"),
-            _ => None,
-        },
+        Provider::Xai if xai_model_supports_reasoning_effort(upstream_model) => {
+            xai_reasoning_effort(tier)
+        }
+        Provider::Xai => None,
         Provider::Fireworks => match tier.trim().to_ascii_lowercase().as_str() {
             "minimal" | "low" => Some("low"),
             "medium" => Some("medium"),
@@ -92,6 +94,24 @@ fn apply_reasoning_effort(provider: Provider, request: &Value, upstream: &mut Va
             "reasoning_effort".to_string(),
             Value::String(effort.to_string()),
         );
+    }
+}
+
+fn xai_model_supports_reasoning_effort(upstream_model: &str) -> bool {
+    let model = upstream_model
+        .strip_prefix("xai/")
+        .or_else(|| upstream_model.strip_prefix("grok/"))
+        .unwrap_or(upstream_model);
+    model == "grok-4.3" || model.starts_with("grok-4.20-multi-agent")
+}
+
+fn xai_reasoning_effort(tier: &str) -> Option<&'static str> {
+    match tier.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "none" => Some("none"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" | "max" => Some("high"),
+        _ => None,
     }
 }
 
@@ -206,7 +226,7 @@ pub fn anthropic_request_to_responses(
     }
 
     if let Some(tier) = request.get("reasoning_effort").and_then(Value::as_str) {
-        if let Some(effort) = responses_reasoning_effort(provider, tier) {
+        if let Some(effort) = responses_reasoning_effort(provider, upstream_model, tier) {
             upstream["reasoning"] = json!({ "effort": effort });
         }
     }
@@ -214,15 +234,16 @@ pub fn anthropic_request_to_responses(
     Ok(upstream)
 }
 
-fn responses_reasoning_effort(provider: Provider, tier: &str) -> Option<&'static str> {
+fn responses_reasoning_effort(
+    provider: Provider,
+    upstream_model: &str,
+    tier: &str,
+) -> Option<&'static str> {
     match provider {
-        Provider::Xai => match tier.trim().to_ascii_lowercase().as_str() {
-            "minimal" | "none" => Some("none"),
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" | "xhigh" | "max" => Some("high"),
-            _ => None,
-        },
+        Provider::Xai if xai_model_supports_reasoning_effort(upstream_model) => {
+            xai_reasoning_effort(tier)
+        }
+        Provider::Xai => None,
         _ => openai_reasoning_effort(tier),
     }
 }
@@ -1189,6 +1210,23 @@ mod tests {
     }
 
     #[test]
+    fn drops_reasoning_effort_for_xai_grok_build_chat_completions() {
+        let request = json!({
+            "model": "aura-grok-build-0-1",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "high"
+        });
+        let upstream =
+            request_to_upstream(Provider::Xai, "grok-build-0.1", &request).expect("translation");
+        assert_eq!(upstream["model"], "grok-build-0.1");
+        assert!(
+            upstream.get("reasoning_effort").is_none(),
+            "Grok Build must not receive unsupported reasoning_effort: {upstream}"
+        );
+    }
+
+    #[test]
     fn folds_minimal_to_low_for_fireworks_open_weight() {
         let request = json!({
             "model": "aura-oss-120b",
@@ -1341,6 +1379,28 @@ mod tests {
             "https://mcp.deepwiki.com/mcp"
         );
         assert_eq!(upstream["tools"][1]["allowed_tools"][0], "ask_question");
+    }
+
+    #[test]
+    fn xai_responses_request_omits_reasoning_for_grok_build() {
+        let request = json!({
+            "model": "aura-grok-build-0-1",
+            "max_tokens": 512,
+            "reasoning_effort": "high",
+            "xai_tools": [{
+                "type": "web_search"
+            }],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let upstream = anthropic_request_to_responses(Provider::Xai, &request, "grok-build-0.1")
+            .expect("xai responses translation");
+
+        assert_eq!(upstream["model"], "grok-build-0.1");
+        assert!(
+            upstream.get("reasoning").is_none(),
+            "Grok Build must not receive unsupported reasoning: {upstream}"
+        );
+        assert_eq!(upstream["tools"][0]["type"], "web_search");
     }
 
     #[test]

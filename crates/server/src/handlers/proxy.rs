@@ -1686,6 +1686,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xai_live_smoke_drops_reasoning_for_grok_build() {
+        dotenvy::dotenv().ok();
+        let Some(xai_api_key) = std::env::var("XAI_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!("skipping xAI Grok Build live smoke test because XAI_API_KEY is missing");
+            return;
+        };
+
+        let cookie_secret = "test-cookie-secret";
+        let jwt = test_jwt(cookie_secret, "user-xai-build-smoke");
+        let (billing_url, _billing_handle) = start_mock_billing().await;
+
+        let mut state = test_state(cookie_secret, billing_url, "unused".to_string(), None, None);
+        state.xai_api_key = Some(xai_api_key);
+        let app = router::create_router().with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "aura-grok-build-0-1",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "reasoning_effort": "high",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Reply with exactly XAI_BUILD_OK and nothing else."
+                                }
+                            ]
+                        }
+                    ]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let response: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("normalized xAI Grok Build response");
+        assert_eq!(response["model"], "aura-grok-build-0-1");
+        let text = response["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                        .then(|| block.get("text").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("XAI_BUILD_OK"),
+            "expected live xAI Grok Build response to contain XAI_BUILD_OK, got: {text}"
+        );
+        assert!(
+            response["usage"]["input_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "expected xAI Grok Build input token count to be populated: {response}"
+        );
+        assert!(
+            response["usage"]["output_tokens"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "expected xAI Grok Build output token count to be populated: {response}"
+        );
+    }
+
+    #[tokio::test]
     async fn fireworks_live_smoke_for_aura_managed_model() {
         dotenvy::dotenv().ok();
         let Some(fireworks_api_key) = std::env::var("FIREWORKS_API_KEY")
