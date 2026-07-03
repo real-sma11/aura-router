@@ -96,7 +96,7 @@ The `model` field determines which upstream provider handles the request.
 Unsupported model prefixes return `400 Bad Request`.
 
 OpenAI routing requires the `OPENAI_API_KEY` environment variable to be configured; if it is absent, requests for OpenAI models return `400 Bad Request`.
-xAI routing requires the `XAI_API_KEY` environment variable to be configured; if it is absent, requests for Grok models return `400 Bad Request`.
+xAI routing requires Aura's platform `XAI_API_KEY` environment variable to be configured; if it is absent, requests for Grok models return `400 Bad Request`. Caller-supplied provider-key headers are ignored for xAI model routing; X account access should be exposed through configured MCP tools instead.
 
 #### xAI Tools and Remote MCP
 

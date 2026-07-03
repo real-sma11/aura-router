@@ -112,29 +112,7 @@ pub async fn messages(
     // [ENRICHMENT HOOK — v1: pass-through, future: RAG/memory/prompt modification]
 
     // Resolve API key for the provider
-    let api_key = match resolved_model.provider {
-        providers::Provider::Anthropic => state.anthropic_api_key.clone(),
-        providers::Provider::OpenAi => state
-            .openai_api_key
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("OpenAI provider not configured".into()))?,
-        providers::Provider::Xai => state
-            .xai_api_key
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("xAI provider not configured".into()))?,
-        providers::Provider::Fireworks => state
-            .fireworks_api_key
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("Fireworks provider not configured".into()))?,
-        providers::Provider::DeepSeek => state
-            .deepseek_api_key
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("DeepSeek provider not configured".into()))?,
-        providers::Provider::Google => state
-            .google_api_key
-            .clone()
-            .ok_or_else(|| AppError::BadRequest("Google provider not configured".into()))?,
-    };
+    let api_key = resolve_provider_api_key(&state, resolved_model.provider)?;
 
     // Forward to provider. Google encodes the model + streaming mode in the
     // URL path, so it is built separately from the static per-provider URLs.
@@ -223,6 +201,35 @@ pub async fn messages(
         request_start,
     )
     .await
+}
+
+fn resolve_provider_api_key(
+    state: &AppState,
+    provider: providers::Provider,
+) -> Result<String, AppError> {
+    match provider {
+        providers::Provider::Anthropic => Ok(state.anthropic_api_key.clone()),
+        providers::Provider::OpenAi => state
+            .openai_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("OpenAI provider not configured".into())),
+        providers::Provider::Xai => state
+            .xai_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("xAI provider not configured".into())),
+        providers::Provider::Fireworks => state
+            .fireworks_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("Fireworks provider not configured".into())),
+        providers::Provider::DeepSeek => state
+            .deepseek_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("DeepSeek provider not configured".into())),
+        providers::Provider::Google => state
+            .google_api_key
+            .clone()
+            .ok_or_else(|| AppError::BadRequest("Google provider not configured".into())),
+    }
 }
 
 /// Handle non-streaming response: read full body, extract usage, debit, return.
@@ -856,6 +863,44 @@ mod tests {
             s3_config: None,
             watermark_bytes: None,
         }
+    }
+
+    #[test]
+    fn xai_requires_platform_key() {
+        let state = test_state(
+            "test-cookie-secret",
+            "http://billing.test".to_string(),
+            "anthropic-unused".to_string(),
+            None,
+            None,
+        );
+
+        let error =
+            super::resolve_provider_api_key(&state, aura_router_proxy::providers::Provider::Xai)
+                .expect_err("Grok should require Aura's platform xAI key");
+
+        assert_eq!(
+            error.to_string(),
+            "Bad request: xAI provider not configured"
+        );
+    }
+
+    #[test]
+    fn xai_uses_platform_key() {
+        let mut state = test_state(
+            "test-cookie-secret",
+            "http://billing.test".to_string(),
+            "anthropic-unused".to_string(),
+            None,
+            None,
+        );
+        state.xai_api_key = Some("platform-xai-key".to_string());
+
+        let key =
+            super::resolve_provider_api_key(&state, aura_router_proxy::providers::Provider::Xai)
+                .expect("platform xAI key should configure provider");
+
+        assert_eq!(key, "platform-xai-key");
     }
 
     #[test]
