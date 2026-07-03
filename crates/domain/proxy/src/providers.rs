@@ -168,19 +168,9 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "grok-4.3",
             provider: Provider::Xai,
         }),
-        "aura-grok-build-0-1" => Some(ResolvedModel {
-            requested_model: model,
-            upstream_model: "grok-build-0.1",
-            provider: Provider::Xai,
-        }),
         "xai/grok-4.3" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "grok-4.3",
-            provider: Provider::Xai,
-        }),
-        "xai/grok-build-0.1" => Some(ResolvedModel {
-            requested_model: model,
-            upstream_model: "grok-build-0.1",
             provider: Provider::Xai,
         }),
         // DeepSeek V4 models are served via Fireworks (which hosts them
@@ -510,7 +500,6 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "gpt-5.4-nano" => 400_000,
         // xAI
         "grok-4.3" => 1_000_000,
-        "grok-build-0.1" => 256_000,
         m if m.starts_with("gpt-4o") => 128_000,
         m if m.starts_with("gpt-4-turbo") => 128_000,
         m if m.starts_with("gpt-4") => 8_192,
@@ -751,7 +740,6 @@ mod tests {
             ("aura-gpt-5-5", "OpenAI"),
             ("aura-oss-120b", "OpenAI"),
             ("aura-grok-4-3", "xAI"),
-            ("xai/grok-build-0.1", "xAI"),
             ("aura-gemini-3-1-pro", "Google"),
             ("aura-deepseek-v4-pro", "DeepSeek AI"),
             ("deepseek/deepseek-v4-flash", "DeepSeek AI"),
@@ -776,7 +764,6 @@ mod tests {
         assert_eq!(resolve_provider("aura-gpt-5-5"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-gpt-5-4"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-grok-4-3"), Some(Provider::Xai));
-        assert_eq!(resolve_provider("aura-grok-build-0-1"), Some(Provider::Xai));
         assert_eq!(
             resolve_provider("aura-kimi-k2-5"),
             Some(Provider::Fireworks)
@@ -835,9 +822,18 @@ mod tests {
             ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
-            ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
-            ("aura-qwen3-7-plus", "accounts/fireworks/models/qwen3p7-plus"),
-            ("aura-kimi-k2-7-code", "accounts/fireworks/models/kimi-k2p7-code"),
+            (
+                "aura-qwen3-6-plus",
+                "accounts/fireworks/models/qwen3p6-plus",
+            ),
+            (
+                "aura-qwen3-7-plus",
+                "accounts/fireworks/models/qwen3p7-plus",
+            ),
+            (
+                "aura-kimi-k2-7-code",
+                "accounts/fireworks/models/kimi-k2p7-code",
+            ),
         ] {
             let resolved = resolve_model(alias).expect("aura alias should resolve");
             assert_eq!(resolved.upstream_model, upstream);
@@ -858,8 +854,6 @@ mod tests {
         for (alias, upstream, context) in [
             ("aura-grok-4-3", "grok-4.3", 1_000_000),
             ("xai/grok-4.3", "grok-4.3", 1_000_000),
-            ("aura-grok-build-0-1", "grok-build-0.1", 256_000),
-            ("xai/grok-build-0.1", "grok-build-0.1", 256_000),
         ] {
             let resolved = resolve_model(alias).expect("grok alias should resolve");
             assert_eq!(resolved.upstream_model, upstream);

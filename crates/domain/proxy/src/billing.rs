@@ -136,13 +136,6 @@ fn xai_rates(model: &str) -> Option<CacheAwareRates> {
             output_cents_per_million: 250.0,
             input_tokens_is_new_only: false,
         }),
-        "aura-grok-build-0-1" | "grok-build-0.1" => Some(CacheAwareRates {
-            new_input_cents_per_million: 100.0,
-            cache_write_input_cents_per_million: 100.0,
-            cache_read_input_cents_per_million: 20.0,
-            output_cents_per_million: 200.0,
-            input_tokens_is_new_only: false,
-        }),
         _ => None,
     }
 }
@@ -666,24 +659,6 @@ mod tests {
             cache_aware_cost_cents("xai", "aura-grok-4-3", 1_000_000, 500_000, 0, 1_000_000),
             Some(174)
         );
-        assert_eq!(
-            cache_aware_cost_cents(
-                "xai",
-                "xai/grok-build-0.1",
-                1_000_000,
-                500_000,
-                0,
-                1_000_000
-            ),
-            cache_aware_cost_cents(
-                "xai",
-                "aura-grok-build-0-1",
-                1_000_000,
-                500_000,
-                0,
-                1_000_000
-            ),
-        );
     }
 
     #[test]
@@ -930,9 +905,18 @@ mod tests {
             ),
             ("aura-glm-5-1", "accounts/fireworks/models/glm-5p1"),
             ("aura-glm-5-2", "accounts/fireworks/models/glm-5p2"),
-            ("aura-qwen3-6-plus", "accounts/fireworks/models/qwen3p6-plus"),
-            ("aura-qwen3-7-plus", "accounts/fireworks/models/qwen3p7-plus"),
-            ("aura-kimi-k2-7-code", "accounts/fireworks/models/kimi-k2p7-code"),
+            (
+                "aura-qwen3-6-plus",
+                "accounts/fireworks/models/qwen3p6-plus",
+            ),
+            (
+                "aura-qwen3-7-plus",
+                "accounts/fireworks/models/qwen3p7-plus",
+            ),
+            (
+                "aura-kimi-k2-7-code",
+                "accounts/fireworks/models/kimi-k2p7-code",
+            ),
         ] {
             let via_alias =
                 cache_aware_cost_cents("fireworks", alias, 1_000_000, 500_000, 0, 200_000);
