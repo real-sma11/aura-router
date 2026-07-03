@@ -99,6 +99,8 @@ LLM Provider (api.anthropic.com / api.openai.com / api.x.ai)
 Grok requests with tools, `xai_tools`, `server_tools`, or `xai_mcp_servers`
 route through xAI's OpenAI-compatible Responses API so Remote MCP and
 server-side xAI tools can run upstream.
+Grok model routing uses Aura's platform `XAI_API_KEY`; user X account access
+belongs behind explicit MCP server/tool integrations.
 
 ---
 

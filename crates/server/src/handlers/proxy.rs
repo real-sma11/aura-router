@@ -11,8 +11,6 @@ use aura_router_proxy::{anthropic_compat, billing, providers, stats, storage, st
 
 use crate::state::AppState;
 
-const PROVIDER_API_KEY_HEADER: &str = "x-aura-provider-api-key";
-
 /// POST /v1/messages — Anthropic-compatible proxy endpoint.
 ///
 /// Flow:
@@ -114,8 +112,7 @@ pub async fn messages(
     // [ENRICHMENT HOOK — v1: pass-through, future: RAG/memory/prompt modification]
 
     // Resolve API key for the provider
-    let api_key =
-        resolve_provider_api_key(&state, resolved_model.provider, &headers, is_public_guest)?;
+    let api_key = resolve_provider_api_key(&state, resolved_model.provider)?;
 
     // Forward to provider. Google encodes the model + streaming mode in the
     // URL path, so it is built separately from the static per-provider URLs.
@@ -209,20 +206,16 @@ pub async fn messages(
 fn resolve_provider_api_key(
     state: &AppState,
     provider: providers::Provider,
-    headers: &axum::http::HeaderMap,
-    is_public_guest: bool,
 ) -> Result<String, AppError> {
-    let user_provider_key = (!is_public_guest)
-        .then(|| provider_api_key_override(headers))
-        .flatten();
     match provider {
         providers::Provider::Anthropic => Ok(state.anthropic_api_key.clone()),
         providers::Provider::OpenAi => state
             .openai_api_key
             .clone()
             .ok_or_else(|| AppError::BadRequest("OpenAI provider not configured".into())),
-        providers::Provider::Xai => user_provider_key
-            .or_else(|| state.xai_api_key.clone())
+        providers::Provider::Xai => state
+            .xai_api_key
+            .clone()
             .ok_or_else(|| AppError::BadRequest("xAI provider not configured".into())),
         providers::Provider::Fireworks => state
             .fireworks_api_key
@@ -237,15 +230,6 @@ fn resolve_provider_api_key(
             .clone()
             .ok_or_else(|| AppError::BadRequest("Google provider not configured".into())),
     }
-}
-
-fn provider_api_key_override(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(PROVIDER_API_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 /// Handle non-streaming response: read full body, extract usage, debit, return.
@@ -727,7 +711,7 @@ mod tests {
     use crate::{router, state::AppState};
     use aura_router_auth::{InternalToken, TokenValidator};
     use axum::body::Body;
-    use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
     use axum::routing::post;
     use axum::{Json, Router};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -882,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_provider_key_header_satisfies_missing_env_key_for_authenticated_requests() {
+    fn xai_requires_platform_key() {
         let state = test_state(
             "test-cookie-secret",
             "http://billing.test".to_string(),
@@ -890,50 +874,33 @@ mod tests {
             None,
             None,
         );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            super::PROVIDER_API_KEY_HEADER,
-            HeaderValue::from_static("xai-workspace-key"),
-        );
 
-        let key = super::resolve_provider_api_key(
-            &state,
-            aura_router_proxy::providers::Provider::Xai,
-            &headers,
-            false,
-        )
-        .expect("xAI workspace key should configure provider");
-
-        assert_eq!(key, "xai-workspace-key");
-    }
-
-    #[test]
-    fn xai_provider_key_header_is_ignored_for_public_guest_requests() {
-        let state = test_state(
-            "test-cookie-secret",
-            "http://billing.test".to_string(),
-            "anthropic-unused".to_string(),
-            None,
-            None,
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            super::PROVIDER_API_KEY_HEADER,
-            HeaderValue::from_static("xai-workspace-key"),
-        );
-
-        let error = super::resolve_provider_api_key(
-            &state,
-            aura_router_proxy::providers::Provider::Xai,
-            &headers,
-            true,
-        )
-        .expect_err("public guests must not supply provider credentials");
+        let error =
+            super::resolve_provider_api_key(&state, aura_router_proxy::providers::Provider::Xai)
+                .expect_err("Grok should require Aura's platform xAI key");
 
         assert_eq!(
             error.to_string(),
             "Bad request: xAI provider not configured"
         );
+    }
+
+    #[test]
+    fn xai_uses_platform_key() {
+        let mut state = test_state(
+            "test-cookie-secret",
+            "http://billing.test".to_string(),
+            "anthropic-unused".to_string(),
+            None,
+            None,
+        );
+        state.xai_api_key = Some("platform-xai-key".to_string());
+
+        let key =
+            super::resolve_provider_api_key(&state, aura_router_proxy::providers::Provider::Xai)
+                .expect("platform xAI key should configure provider");
+
+        assert_eq!(key, "platform-xai-key");
     }
 
     #[test]
