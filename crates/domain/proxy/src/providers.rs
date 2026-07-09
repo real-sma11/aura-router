@@ -163,6 +163,11 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "o4-mini",
             provider: Provider::OpenAi,
         }),
+        "aura-grok-4-5" | "xai/grok-4.5" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "grok-4.5",
+            provider: Provider::Xai,
+        }),
         "aura-grok-4-3" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "grok-4.3",
@@ -508,6 +513,7 @@ pub fn max_context_tokens(model: &str) -> u64 {
         "gpt-5.4-mini" => 400_000,
         "gpt-5.4-nano" => 400_000,
         // xAI
+        "grok-4.5" => 500_000,
         "grok-4.3" => 1_000_000,
         "grok-build-0.1" | "grok-code-fast" | "grok-code-fast-1" | "grok-code-fast-1-0825" => {
             256_000
@@ -751,6 +757,7 @@ mod tests {
             ("aura-claude-opus-4-8", "Anthropic"),
             ("aura-gpt-5-5", "OpenAI"),
             ("aura-oss-120b", "OpenAI"),
+            ("aura-grok-4-5", "xAI"),
             ("aura-grok-4-3", "xAI"),
             ("aura-grok-build-0-1", "xAI"),
             ("aura-gemini-3-1-pro", "Google"),
@@ -776,6 +783,7 @@ mod tests {
     fn resolve_provider_understands_aura_aliases() {
         assert_eq!(resolve_provider("aura-gpt-5-5"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-gpt-5-4"), Some(Provider::OpenAi));
+        assert_eq!(resolve_provider("aura-grok-4-5"), Some(Provider::Xai));
         assert_eq!(resolve_provider("aura-grok-4-3"), Some(Provider::Xai));
         assert_eq!(resolve_provider("aura-grok-build-0-1"), Some(Provider::Xai));
         assert_eq!(
@@ -866,6 +874,8 @@ mod tests {
     #[test]
     fn resolves_grok_aliases_to_xai() {
         for (alias, upstream, context) in [
+            ("aura-grok-4-5", "grok-4.5", 500_000),
+            ("xai/grok-4.5", "grok-4.5", 500_000),
             ("aura-grok-4-3", "grok-4.3", 1_000_000),
             ("xai/grok-4.3", "grok-4.3", 1_000_000),
             ("aura-grok-build-0-1", "grok-build-0.1", 256_000),

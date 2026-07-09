@@ -102,7 +102,7 @@ fn xai_model_supports_reasoning_effort(upstream_model: &str) -> bool {
         .strip_prefix("xai/")
         .or_else(|| upstream_model.strip_prefix("grok/"))
         .unwrap_or(upstream_model);
-    model == "grok-4.3" || model.starts_with("grok-4.20-multi-agent")
+    model == "grok-4.5" || model == "grok-4.3" || model.starts_with("grok-4.20-multi-agent")
 }
 
 fn xai_reasoning_effort(tier: &str) -> Option<&'static str> {
@@ -1182,6 +1182,19 @@ mod tests {
 
     #[test]
     fn translates_reasoning_effort_to_xai_native() {
+        let request = json!({
+            "model": "aura-grok-4-5",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 1024,
+            "reasoning_effort": "high"
+        });
+        let upstream =
+            request_to_upstream(Provider::Xai, "grok-4.5", &request).expect("translation");
+        assert_eq!(
+            upstream["reasoning_effort"],
+            Value::String("high".to_string())
+        );
+
         let request = json!({
             "model": "aura-grok-4-3",
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],

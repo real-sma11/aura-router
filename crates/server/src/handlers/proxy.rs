@@ -149,7 +149,13 @@ pub async fn messages(
         )
         .map_err(AppError::BadRequest)?,
     };
-    apply_provider_request_controls(provider, &mut upstream_request_value, session_ctx.as_ref());
+    apply_provider_request_controls(
+        provider,
+        openai_api,
+        &mut upstream_headers,
+        &mut upstream_request_value,
+        session_ctx.as_ref(),
+    );
     let upstream_body = serde_json::to_vec(&upstream_request_value)
         .map_err(|e| AppError::Internal(format!("Failed to encode upstream body: {e}")))?;
 
@@ -470,28 +476,42 @@ fn provider_from_name(provider_name: &str) -> providers::Provider {
 
 fn apply_provider_request_controls(
     provider: providers::Provider,
+    openai_api: providers::OpenAiApi,
+    upstream_headers: &mut reqwest::header::HeaderMap,
     upstream_body: &mut serde_json::Value,
     session_ctx: Option<&storage::SessionContext>,
 ) {
-    if provider != providers::Provider::OpenAi {
-        return;
-    }
-
     // The harness owns `prompt_cache_key` derivation and clamps it to
     // OpenAI's 64-char limit before threading it via the
     // `X-Aura-Prompt-Cache-Key` header. The router forwards that value
     // verbatim and never synthesizes its own (a router-built
     // org/project/agent/model key overran the 64-char limit and tripped
-    // OpenAI's `invalid_request_error`). When no key is threaded, the
-    // request simply goes out without one (no prompt caching).
+    // OpenAI's `invalid_request_error`). For xAI, Chat Completions uses
+    // `x-grok-conv-id`, while Responses uses `prompt_cache_key`.
+    // When no key is threaded, the request simply goes out without one.
     let Some(cache_key) = session_ctx.and_then(|ctx| ctx.prompt_cache_key.as_deref()) else {
         return;
     };
-    let Some(body) = upstream_body.as_object_mut() else {
-        return;
-    };
-    body.entry("prompt_cache_key")
-        .or_insert_with(|| serde_json::Value::String(cache_key.to_string()));
+
+    match (provider, openai_api) {
+        (providers::Provider::OpenAi, _)
+        | (providers::Provider::Xai, providers::OpenAiApi::Responses) => {
+            let Some(body) = upstream_body.as_object_mut() else {
+                return;
+            };
+            body.entry("prompt_cache_key")
+                .or_insert_with(|| serde_json::Value::String(cache_key.to_string()));
+        }
+        (providers::Provider::Xai, providers::OpenAiApi::ChatCompletions) => {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(cache_key) {
+                upstream_headers.insert(
+                    reqwest::header::HeaderName::from_static("x-grok-conv-id"),
+                    value,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_upstream_error(status: StatusCode, error_body: &[u8]) -> Response {
@@ -916,9 +936,12 @@ mod tests {
             "model": "gpt-5.5",
             "messages": []
         });
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
 
         super::apply_provider_request_controls(
             aura_router_proxy::providers::Provider::OpenAi,
+            aura_router_proxy::providers::OpenAiApi::ChatCompletions,
+            &mut upstream_headers,
             &mut upstream,
             Some(&session),
         );
@@ -939,9 +962,12 @@ mod tests {
             prompt_cache_key: None,
         };
         let mut upstream = json!({ "model": "gpt-5.5", "messages": [] });
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
 
         super::apply_provider_request_controls(
             aura_router_proxy::providers::Provider::OpenAi,
+            aura_router_proxy::providers::OpenAiApi::ChatCompletions,
+            &mut upstream_headers,
             &mut upstream,
             Some(&session),
         );
@@ -952,15 +978,55 @@ mod tests {
     }
 
     #[test]
+    fn xai_provider_request_controls_forward_threaded_cache_key() {
+        let session = aura_router_proxy::storage::SessionContext {
+            prompt_cache_key: Some("instance:abc-123".to_string()),
+            ..Default::default()
+        };
+
+        let mut chat_headers = reqwest::header::HeaderMap::new();
+        let mut chat_upstream = json!({ "model": "grok-4.5", "messages": [] });
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::Xai,
+            aura_router_proxy::providers::OpenAiApi::ChatCompletions,
+            &mut chat_headers,
+            &mut chat_upstream,
+            Some(&session),
+        );
+        assert_eq!(
+            chat_headers
+                .get("x-grok-conv-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("instance:abc-123")
+        );
+        assert!(chat_upstream.get("prompt_cache_key").is_none());
+
+        let mut responses_headers = reqwest::header::HeaderMap::new();
+        let mut responses_upstream = json!({ "model": "grok-4.5", "input": [] });
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::Xai,
+            aura_router_proxy::providers::OpenAiApi::Responses,
+            &mut responses_headers,
+            &mut responses_upstream,
+            Some(&session),
+        );
+        assert!(responses_headers.get("x-grok-conv-id").is_none());
+        assert_eq!(responses_upstream["prompt_cache_key"], "instance:abc-123");
+    }
+
+    #[test]
     fn provider_request_controls_skip_non_openai() {
         let session = aura_router_proxy::storage::SessionContext {
             prompt_cache_key: Some("instance:abc-123".to_string()),
             ..Default::default()
         };
         let mut upstream = json!({ "model": "claude", "messages": [] });
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
 
         super::apply_provider_request_controls(
             aura_router_proxy::providers::Provider::Anthropic,
+            aura_router_proxy::providers::OpenAiApi::ChatCompletions,
+            &mut upstream_headers,
             &mut upstream,
             Some(&session),
         );

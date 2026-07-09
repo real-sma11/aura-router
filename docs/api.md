@@ -98,6 +98,10 @@ Unsupported model prefixes return `400 Bad Request`.
 OpenAI routing requires the `OPENAI_API_KEY` environment variable to be configured; if it is absent, requests for OpenAI models return `400 Bad Request`.
 xAI routing requires Aura's platform `XAI_API_KEY` environment variable to be configured; if it is absent, requests for Grok models return `400 Bad Request`. Caller-supplied provider-key headers are ignored for xAI model routing; X account access should be exposed through configured MCP tools instead.
 
+When a caller supplies `X-Aura-Prompt-Cache-Key`, the router forwards it to
+xAI Chat Completions as `x-grok-conv-id`; tool-bearing xAI Responses requests
+receive the same value as `prompt_cache_key`.
+
 #### xAI Tools and Remote MCP
 
 Grok requests that include any non-empty `tools`, `xai_tools`, `server_tools`, or `xai_mcp_servers` array are routed through xAI's OpenAI-compatible Responses API. Anthropic-style `tools` are translated into Responses function tools. xAI-native server-side tool objects are passed through from `xai_tools` or `server_tools`.
@@ -106,7 +110,7 @@ Remote MCP servers can be supplied with `xai_mcp_servers`:
 
 ```json
 {
-  "model": "aura-grok-4-3",
+  "model": "aura-grok-4-5",
   "max_tokens": 512,
   "messages": [
     { "role": "user", "content": [{ "type": "text", "text": "Search the docs" }] }
