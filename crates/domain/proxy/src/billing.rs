@@ -129,6 +129,13 @@ fn xai_rates(model: &str) -> Option<CacheAwareRates> {
         .or_else(|| model.strip_prefix("grok/"))
         .unwrap_or(model);
     match model {
+        "aura-grok-4-5" | "grok-4.5" => Some(CacheAwareRates {
+            new_input_cents_per_million: 200.0,
+            cache_write_input_cents_per_million: 200.0,
+            cache_read_input_cents_per_million: 50.0,
+            output_cents_per_million: 600.0,
+            input_tokens_is_new_only: false,
+        }),
         "aura-grok-4-3" | "grok-4.3" => Some(CacheAwareRates {
             new_input_cents_per_million: 125.0,
             cache_write_input_cents_per_million: 125.0,
@@ -664,6 +671,12 @@ mod tests {
 
     #[test]
     fn xai_grok_cache_aware_cost_discounts_cached_tokens() {
+        // grok-4.5: new 0, cache_read 1M x 50, output 500k x 600.
+        // (50_000_000 + 300_000_000) x 1.2 / 1M = 420
+        assert_eq!(
+            cache_aware_cost_cents("xai", "aura-grok-4-5", 1_000_000, 500_000, 0, 1_000_000),
+            Some(420)
+        );
         // grok-4.3: new 0, cache_read 1M x 20, output 500k x 250.
         // (20_000_000 + 125_000_000) x 1.2 / 1M = 174
         assert_eq!(

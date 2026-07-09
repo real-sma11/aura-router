@@ -101,6 +101,8 @@ route through xAI's OpenAI-compatible Responses API so Remote MCP and
 server-side xAI tools can run upstream.
 Grok model routing uses Aura's platform `XAI_API_KEY`; user X account access
 belongs behind explicit MCP server/tool integrations.
+Aura prompt-cache keys are forwarded to xAI Chat Completions as
+`x-grok-conv-id` and to xAI Responses as `prompt_cache_key`.
 
 ---
 
