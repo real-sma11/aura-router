@@ -42,6 +42,7 @@ pub fn request_to_upstream(
             validate_openai_request(request)?;
             let mut upstream = anthropic_request_to_openai(request, upstream_model)?;
             apply_reasoning_effort(provider, upstream_model, request, &mut upstream);
+            apply_openai_prompt_cache_controls(provider, upstream_model, request, &mut upstream);
             Ok(upstream)
         }
         Provider::Google => {
@@ -57,8 +58,9 @@ pub fn request_to_upstream(
 /// `anthropic_request_to_openai` builds a fresh upstream object, so the
 /// neutral hint never leaks through on its own — it is only attached
 /// here, clamped to the values the target provider accepts:
-/// - OpenAI accepts `minimal`/`low`/`medium`/`high` (no `max`/`xhigh`,
-///   which fold to `high`).
+/// - OpenAI GPT-5.4/5.5 models accept
+///   `none`/`low`/`medium`/`high`/`xhigh`; GPT-5.6 adds `max`.
+///   Aura's neutral `minimal` endpoint maps to `none`.
 /// - xAI Grok reasoning models accept `none`/`low`/`medium`/`high`; Aura's
 ///   `minimal` maps to `none`, while larger unsupported tiers fold to `high`.
 /// - Fireworks open-weight models (e.g. GPT-OSS) accept
@@ -74,7 +76,7 @@ fn apply_reasoning_effort(
         return;
     };
     let mapped = match provider {
-        Provider::OpenAi => openai_reasoning_effort(tier),
+        Provider::OpenAi => openai_reasoning_effort(upstream_model, tier),
         Provider::Xai if xai_model_supports_reasoning_effort(upstream_model) => {
             xai_reasoning_effort(tier)
         }
@@ -115,17 +117,84 @@ fn xai_reasoning_effort(tier: &str) -> Option<&'static str> {
     }
 }
 
-/// Clamp the provider-neutral effort tier to the values OpenAI accepts.
-/// OpenAI exposes `minimal`/`low`/`medium`/`high`; the larger Anthropic
-/// tiers (`xhigh`/`max`) fold to `high`. Shared by the chat/completions
-/// (`reasoning_effort`) and Responses (`reasoning.effort`) paths.
-fn openai_reasoning_effort(tier: &str) -> Option<&'static str> {
-    match tier.trim().to_ascii_lowercase().as_str() {
-        "minimal" => Some("minimal"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" | "xhigh" | "max" => Some("high"),
+/// Clamp Aura's provider-neutral effort tier to the values the selected
+/// OpenAI model accepts. GPT-5.4/5.5 replaced `minimal` with `none` and
+/// added `xhigh`; GPT-5.6 adds a distinct `max` tier above `xhigh`.
+/// Older models retain the legacy ladder.
+fn openai_reasoning_effort(upstream_model: &str, tier: &str) -> Option<&'static str> {
+    let is_gpt_5_6 = upstream_model.starts_with("gpt-5.6");
+    let current_ladder = is_gpt_5_6
+        || upstream_model.starts_with("gpt-5.4")
+        || upstream_model.starts_with("gpt-5.5");
+    match (
+        current_ladder,
+        is_gpt_5_6,
+        tier.trim().to_ascii_lowercase().as_str(),
+    ) {
+        (true, _, "minimal" | "none") => Some("none"),
+        (true, _, "low") => Some("low"),
+        (true, _, "medium") => Some("medium"),
+        (true, _, "high") => Some("high"),
+        (true, _, "xhigh") => Some("xhigh"),
+        (true, true, "max") => Some("max"),
+        (true, false, "max") => Some("xhigh"),
+        (false, _, "minimal") => Some("minimal"),
+        (false, _, "low") => Some("low"),
+        (false, _, "medium") => Some("medium"),
+        (false, _, "high" | "xhigh" | "max") => Some("high"),
         _ => None,
+    }
+}
+
+/// Preserve the cache controls the harness carries on its
+/// Anthropic-compatible body. GPT-5.6 requires a stable key for reliable
+/// matching and replaces the legacy retention field with a 30-minute TTL.
+/// GPT-5.5 accepts only 24-hour retention; GPT-5.4 also accepts in-memory
+/// retention. Smaller 5.4 variants must not receive an unsupported value.
+fn apply_openai_prompt_cache_controls(
+    provider: Provider,
+    upstream_model: &str,
+    request: &Value,
+    upstream: &mut Value,
+) {
+    if provider != Provider::OpenAi {
+        return;
+    }
+    let Some(object) = upstream.as_object_mut() else {
+        return;
+    };
+    let cache_key = request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(key) = cache_key {
+        object.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(key.to_string()),
+        );
+    }
+
+    if cache_key.is_some() && upstream_model.starts_with("gpt-5.6") {
+        object.insert("prompt_cache_options".to_string(), json!({ "ttl": "30m" }));
+        return;
+    }
+
+    let retention = request
+        .get("prompt_cache_retention")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let supported = match (upstream_model, retention) {
+        ("gpt-5.5", Some("24h")) => Some("24h"),
+        ("gpt-5.4", Some("24h")) => Some("24h"),
+        ("gpt-5.4", Some("in_memory")) => Some("in_memory"),
+        _ => None,
+    };
+    if let Some(retention) = supported {
+        object.insert(
+            "prompt_cache_retention".to_string(),
+            Value::String(retention.to_string()),
+        );
     }
 }
 
@@ -230,6 +299,7 @@ pub fn anthropic_request_to_responses(
             upstream["reasoning"] = json!({ "effort": effort });
         }
     }
+    apply_openai_prompt_cache_controls(provider, upstream_model, request, &mut upstream);
 
     Ok(upstream)
 }
@@ -244,7 +314,7 @@ fn responses_reasoning_effort(
             xai_reasoning_effort(tier)
         }
         Provider::Xai => None,
-        _ => openai_reasoning_effort(tier),
+        _ => openai_reasoning_effort(upstream_model, tier),
     }
 }
 
@@ -527,6 +597,9 @@ pub fn openai_responses_to_anthropic(
     let cache_read_input_tokens = usage
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64);
+    let cache_creation_input_tokens = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64);
 
     Ok(json!({
         "id": response.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -536,7 +609,7 @@ pub fn openai_responses_to_anthropic(
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": Value::Null,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
         }
     }))
@@ -1023,7 +1096,12 @@ fn openai_response_to_anthropic(response: &Value, requested_model: &str) -> Resu
         });
     let cache_creation_input_tokens = usage
         .get("prompt_cache_miss_tokens")
-        .and_then(Value::as_u64);
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+        });
 
     let cache_read_input_tokens = cache_read_input_tokens
         .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
@@ -1162,10 +1240,10 @@ mod tests {
             request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
         assert_eq!(
             upstream["reasoning_effort"],
-            Value::String("minimal".to_string())
+            Value::String("none".to_string())
         );
 
-        // OpenAI has no `max`; it folds to `high`.
+        // Aura's neutral `max` maps to OpenAI's native `xhigh`.
         let request = json!({
             "model": "aura-gpt-5-5",
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
@@ -1176,8 +1254,64 @@ mod tests {
             request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
         assert_eq!(
             upstream["reasoning_effort"],
-            Value::String("high".to_string())
+            Value::String("xhigh".to_string())
         );
+    }
+
+    #[test]
+    fn forwards_supported_openai_prompt_cache_controls() {
+        let request = json!({
+            "model": "aura-gpt-5-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "instance:abc-123",
+            "prompt_cache_retention": "24h"
+        });
+        let chat = request_to_upstream(Provider::OpenAi, "gpt-5.5", &request).expect("translation");
+        assert_eq!(chat["prompt_cache_key"], "instance:abc-123");
+        assert_eq!(chat["prompt_cache_retention"], "24h");
+
+        let responses = anthropic_request_to_openai_responses(&request, "gpt-5.5")
+            .expect("responses translation");
+        assert_eq!(responses["prompt_cache_key"], "instance:abc-123");
+        assert_eq!(responses["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn translates_gpt_5_6_effort_and_cache_controls() {
+        let request = json!({
+            "model": "aura-gpt-5-6-sol",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "max",
+            "prompt_cache_key": "instance:abc-123",
+            "prompt_cache_retention": "24h"
+        });
+        let chat =
+            request_to_upstream(Provider::OpenAi, "gpt-5.6-sol", &request).expect("translation");
+        assert_eq!(chat["reasoning_effort"], "max");
+        assert_eq!(chat["prompt_cache_key"], "instance:abc-123");
+        assert_eq!(chat["prompt_cache_options"]["ttl"], "30m");
+        assert!(chat.get("prompt_cache_retention").is_none());
+
+        let mut xhigh = request.clone();
+        xhigh["reasoning_effort"] = json!("xhigh");
+        let responses = anthropic_request_to_openai_responses(&xhigh, "gpt-5.6-sol")
+            .expect("responses translation");
+        assert_eq!(responses["reasoning"]["effort"], "xhigh");
+        assert_eq!(responses["prompt_cache_options"]["ttl"], "30m");
+    }
+
+    #[test]
+    fn drops_unsupported_extended_retention_for_gpt_5_4_mini() {
+        let request = json!({
+            "model": "aura-gpt-5-4-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "instance:abc-123",
+            "prompt_cache_retention": "24h"
+        });
+        let upstream =
+            request_to_upstream(Provider::OpenAi, "gpt-5.4-mini", &request).expect("translation");
+        assert_eq!(upstream["prompt_cache_key"], "instance:abc-123");
+        assert!(upstream.get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -1441,7 +1575,10 @@ mod tests {
             "usage": {
                 "input_tokens": 42,
                 "output_tokens": 7,
-                "input_tokens_details": {"cached_tokens": 12}
+                "input_tokens_details": {
+                    "cached_tokens": 12,
+                    "cache_write_tokens": 5
+                }
             }
         });
 
@@ -1459,6 +1596,7 @@ mod tests {
         assert_eq!(normalized["content"][1]["input"]["query"], "aura");
         assert_eq!(normalized["usage"]["input_tokens"], 42);
         assert_eq!(normalized["usage"]["output_tokens"], 7);
+        assert_eq!(normalized["usage"]["cache_creation_input_tokens"], 5);
         assert_eq!(normalized["usage"]["cache_read_input_tokens"], 12);
     }
 
@@ -1623,7 +1761,8 @@ mod tests {
                 "prompt_tokens": 12,
                 "completion_tokens": 7,
                 "prompt_tokens_details": {
-                    "cached_tokens": 8
+                    "cached_tokens": 8,
+                    "cache_write_tokens": 3
                 }
             }
         });
@@ -1637,6 +1776,7 @@ mod tests {
         assert_eq!(translated["content"][1]["type"], "tool_use");
         assert_eq!(translated["usage"]["input_tokens"], 12);
         assert_eq!(translated["usage"]["output_tokens"], 7);
+        assert_eq!(translated["usage"]["cache_creation_input_tokens"], 3);
         assert_eq!(translated["usage"]["cache_read_input_tokens"], 8);
     }
 

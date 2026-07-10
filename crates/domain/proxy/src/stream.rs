@@ -314,6 +314,12 @@ impl OpenAiCompatStream {
                 .and_then(Value::as_u64)
                 .or_else(|| {
                     usage
+                        .get("prompt_tokens_details")
+                        .and_then(|details| details.get("cache_write_tokens"))
+                        .and_then(Value::as_u64)
+                })
+                .or_else(|| {
+                    usage
                         .get("cache_creation_input_tokens")
                         .and_then(Value::as_u64)
                 })
@@ -910,6 +916,10 @@ impl OpenAiResponsesStream {
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(self.usage.output_tokens);
+            self.usage.cache_creation_input_tokens = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.usage.cache_creation_input_tokens);
             self.usage.cache_read_input_tokens = usage
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
@@ -1494,19 +1504,19 @@ mod tests {
     #[tokio::test]
     async fn openai_responses_stream_translates_text_and_tool_calls() {
         let stream = bytes_stream(vec![
-            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\"}}\n\n",
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6-sol\"}}\n\n",
             "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"delta\":\"Hello\"}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"search_repo\"}}\n\n",
             "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"{\\\"query\\\":\"}\n\n",
             "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_1\",\"delta\":\"\\\"aura\\\"}\"}\n\n",
             "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"search_repo\"}}\n\n",
-            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4},\"cost_in_usd_ticks\":250000000}}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.6-sol\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":3},\"cost_in_usd_ticks\":250000000}}}\n\n",
         ]);
         let (tx, rx) = oneshot::channel();
         let mut tee = TeeStream {
             inner: Box::pin(stream),
-            adapter: StreamAdapter::new(Provider::OpenAi, OpenAiApi::Responses, "aura-gpt-5-5"),
+            adapter: StreamAdapter::new(Provider::OpenAi, OpenAiApi::Responses, "aura-gpt-5-6-sol"),
             usage_tx: Some(tx),
             finished: false,
             pending_output: VecDeque::new(),
@@ -1551,6 +1561,7 @@ mod tests {
         let usage = rx.await.unwrap();
         assert_eq!(usage.input_tokens, 21);
         assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
         assert_eq!(usage.cache_read_input_tokens, 4);
         assert_eq!(usage.provider_reported_cost_cents, Some(3));
     }
@@ -1594,7 +1605,7 @@ mod tests {
         let stream = bytes_stream(vec![
             "data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}],\"usage\":null}\n\n",
             "data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
-            "data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-4.1\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+            "data: {\"id\":\"chatcmpl-123\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":3}}}\n\n",
             "data: [DONE]\n\n",
         ]);
         let (tx, rx) = oneshot::channel();
@@ -1618,6 +1629,8 @@ mod tests {
         let usage = rx.await.unwrap();
         assert_eq!(usage.input_tokens, 11);
         assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, 4);
         assert!(emitted
             .iter()
             .any(|chunk| chunk.contains("event: message_start")));

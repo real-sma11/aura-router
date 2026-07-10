@@ -34,6 +34,7 @@ pub struct LlmMetric {
 
 const DEFAULT_LLM_MARKUP_MULTIPLIER: f64 = 1.20;
 const USD_TICKS_PER_CENT: f64 = 100_000_000.0;
+const OPENAI_LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 /// Convert provider-reported USD ticks into marked-up billing cents.
 ///
@@ -55,10 +56,9 @@ struct CacheAwareRates {
     /// served from cache nor written to cache).
     new_input_cents_per_million: f64,
     /// Rate for tokens being written to cache. For providers that bill
-    /// cache writes at the same rate as base input (OpenAI, DeepSeek,
-    /// Fireworks), this equals `new_input_cents_per_million`. For
-    /// providers that charge a premium for cache writes (Anthropic 5m
-    /// ephemeral cache = 1.25× base input), this is higher.
+    /// cache writes at the same rate as base input (OpenAI before GPT-5.6,
+    /// DeepSeek, Fireworks), this equals `new_input_cents_per_million`.
+    /// GPT-5.6 and Anthropic 5m ephemeral writes cost 1.25x base input.
     cache_write_input_cents_per_million: f64,
     /// Rate for tokens served from cache (always cheaper than base input).
     cache_read_input_cents_per_million: f64,
@@ -90,13 +90,29 @@ pub fn cache_aware_cost_cents(
         input_tokens
             .saturating_sub(cache_creation_input_tokens.saturating_add(cache_read_input_tokens))
     };
+    let normalized_model = model.strip_prefix("openai/").unwrap_or(model);
+    let is_long_context_model = matches!(
+        normalized_model,
+        "aura-gpt-5-4" | "gpt-5.4" | "aura-gpt-5-5" | "gpt-5.5"
+    ) || normalized_model.starts_with("aura-gpt-5-6-")
+        || normalized_model.starts_with("gpt-5.6");
+    let is_long_context_openai = provider == "openai"
+        && input_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
+        && is_long_context_model;
+    let input_multiplier = if is_long_context_openai { 2.0 } else { 1.0 };
+    let output_multiplier = if is_long_context_openai { 1.5 } else { 1.0 };
 
-    let total_cents = ((new_input_tokens as f64 * rates.new_input_cents_per_million)
-        + (cache_creation_input_tokens as f64 * rates.cache_write_input_cents_per_million)
-        + (cache_read_input_tokens as f64 * rates.cache_read_input_cents_per_million)
-        + (output_tokens as f64 * rates.output_cents_per_million))
-        * DEFAULT_LLM_MARKUP_MULTIPLIER
-        / 1_000_000.0;
+    let total_cents =
+        ((new_input_tokens as f64 * rates.new_input_cents_per_million * input_multiplier)
+            + (cache_creation_input_tokens as f64
+                * rates.cache_write_input_cents_per_million
+                * input_multiplier)
+            + (cache_read_input_tokens as f64
+                * rates.cache_read_input_cents_per_million
+                * input_multiplier)
+            + (output_tokens as f64 * rates.output_cents_per_million * output_multiplier))
+            * DEFAULT_LLM_MARKUP_MULTIPLIER
+            / 1_000_000.0;
 
     let rounded = total_cents.round() as i64;
     if rounded == 0 && (input_tokens > 0 || output_tokens > 0) {
@@ -290,6 +306,27 @@ fn openai_rates(model: &str) -> Option<CacheAwareRates> {
     let model = model.strip_prefix("openai/").unwrap_or(model);
 
     match model {
+        "aura-gpt-5-6-sol" | "gpt-5.6" | "gpt-5.6-sol" => Some(CacheAwareRates {
+            new_input_cents_per_million: 500.0,
+            cache_write_input_cents_per_million: 625.0,
+            cache_read_input_cents_per_million: 50.0,
+            output_cents_per_million: 3000.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gpt-5-6-terra" | "gpt-5.6-terra" => Some(CacheAwareRates {
+            new_input_cents_per_million: 250.0,
+            cache_write_input_cents_per_million: 312.5,
+            cache_read_input_cents_per_million: 25.0,
+            output_cents_per_million: 1500.0,
+            input_tokens_is_new_only: false,
+        }),
+        "aura-gpt-5-6-luna" | "gpt-5.6-luna" => Some(CacheAwareRates {
+            new_input_cents_per_million: 100.0,
+            cache_write_input_cents_per_million: 125.0,
+            cache_read_input_cents_per_million: 10.0,
+            output_cents_per_million: 600.0,
+            input_tokens_is_new_only: false,
+        }),
         "aura-gpt-5-5" | "gpt-5.5" => Some(CacheAwareRates {
             new_input_cents_per_million: 500.0,
             cache_write_input_cents_per_million: 500.0,
@@ -649,11 +686,46 @@ mod tests {
     fn openai_cache_aware_cost_discounts_cached_tokens() {
         assert_eq!(
             cache_aware_cost_cents("openai", "aura-gpt-5-5", 1_000_000, 500_000, 0, 1_000_000,),
-            Some(1860)
+            Some(2820)
         );
         assert_eq!(
             cache_aware_cost_cents("openai", "gpt-5.4-mini", 1_000_000, 500_000, 0, 1_000_000,),
             Some(279)
+        );
+    }
+
+    #[test]
+    fn gpt_5_6_cache_writes_use_the_published_premium() {
+        // Long-context Sol: 500k new @ $10/M + 200k writes @ $12.50/M +
+        // 300k reads @ $1/M + 500k output @ $45/M, then 20% markup.
+        assert_eq!(
+            cache_aware_cost_cents(
+                "openai",
+                "aura-gpt-5-6-sol",
+                1_000_000,
+                500_000,
+                200_000,
+                300_000,
+            ),
+            Some(3636)
+        );
+
+        // Below the threshold, Luna cache writes remain 1.25x input.
+        assert_eq!(
+            cache_aware_cost_cents("openai", "gpt-5.6-luna", 200_000, 100_000, 100_000, 50_000,),
+            Some(94)
+        );
+    }
+
+    #[test]
+    fn openai_cache_cost_steps_up_only_above_the_long_context_threshold() {
+        assert_eq!(
+            cache_aware_cost_cents("openai", "gpt-5.5", 272_000, 100_000, 0, 272_000),
+            Some(376)
+        );
+        assert_eq!(
+            cache_aware_cost_cents("openai", "gpt-5.5", 272_001, 100_000, 0, 272_001),
+            Some(573)
         );
     }
 
