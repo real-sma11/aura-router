@@ -128,6 +128,21 @@ fn aura_model_alias(model: &str) -> Option<ResolvedModel<'_>> {
             upstream_model: "claude-haiku-4-5",
             provider: Provider::Anthropic,
         }),
+        "aura-gpt-5-6-sol" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gpt-5.6-sol",
+            provider: Provider::OpenAi,
+        }),
+        "aura-gpt-5-6-terra" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gpt-5.6-terra",
+            provider: Provider::OpenAi,
+        }),
+        "aura-gpt-5-6-luna" => Some(ResolvedModel {
+            requested_model: model,
+            upstream_model: "gpt-5.6-luna",
+            provider: Provider::OpenAi,
+        }),
         "aura-gpt-5-5" => Some(ResolvedModel {
             requested_model: model,
             upstream_model: "gpt-5.5",
@@ -508,7 +523,8 @@ pub fn max_context_tokens(model: &str) -> u64 {
         m if m.starts_with("claude-3") => 200_000,
         m if m.starts_with("claude") => 200_000,
         // OpenAI
-        "gpt-5.5" => 1_000_000,
+        m if m.starts_with("gpt-5.6") => 1_050_000,
+        "gpt-5.5" => 1_050_000,
         "gpt-5.4" => 1_050_000,
         "gpt-5.4-mini" => 400_000,
         "gpt-5.4-nano" => 400_000,
@@ -734,6 +750,18 @@ mod tests {
         assert_eq!(resolved.requested_model, "aura-gpt-5-5");
         assert_eq!(resolved.upstream_model, "gpt-5.5");
         assert_eq!(resolved.provider, Provider::OpenAi);
+        assert_eq!(super::max_context_tokens("aura-gpt-5-5"), 1_050_000);
+
+        for (alias, upstream) in [
+            ("aura-gpt-5-6-sol", "gpt-5.6-sol"),
+            ("aura-gpt-5-6-terra", "gpt-5.6-terra"),
+            ("aura-gpt-5-6-luna", "gpt-5.6-luna"),
+        ] {
+            let resolved = resolve_model(alias).expect("GPT-5.6 alias should resolve");
+            assert_eq!(resolved.upstream_model, upstream);
+            assert_eq!(resolved.provider, Provider::OpenAi);
+            assert_eq!(super::max_context_tokens(alias), 1_050_000);
+        }
 
         let resolved = resolve_model("aura-gpt-5-4-mini").expect("model alias should resolve");
         assert_eq!(resolved.requested_model, "aura-gpt-5-4-mini");
@@ -756,6 +784,9 @@ mod tests {
         let cases = [
             ("aura-claude-opus-4-8", "Anthropic"),
             ("aura-gpt-5-5", "OpenAI"),
+            ("aura-gpt-5-6-sol", "OpenAI"),
+            ("aura-gpt-5-6-terra", "OpenAI"),
+            ("aura-gpt-5-6-luna", "OpenAI"),
             ("aura-oss-120b", "OpenAI"),
             ("aura-grok-4-5", "xAI"),
             ("aura-grok-4-3", "xAI"),
@@ -782,6 +813,7 @@ mod tests {
     #[test]
     fn resolve_provider_understands_aura_aliases() {
         assert_eq!(resolve_provider("aura-gpt-5-5"), Some(Provider::OpenAi));
+        assert_eq!(resolve_provider("aura-gpt-5-6-sol"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-gpt-5-4"), Some(Provider::OpenAi));
         assert_eq!(resolve_provider("aura-grok-4-5"), Some(Provider::Xai));
         assert_eq!(resolve_provider("aura-grok-4-3"), Some(Provider::Xai));

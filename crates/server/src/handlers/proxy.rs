@@ -501,6 +501,16 @@ fn apply_provider_request_controls(
             };
             body.entry("prompt_cache_key")
                 .or_insert_with(|| serde_json::Value::String(cache_key.to_string()));
+            let is_gpt_5_6 = provider == providers::Provider::OpenAi
+                && body
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|model| model.starts_with("gpt-5.6"));
+            if is_gpt_5_6 {
+                body.remove("prompt_cache_retention");
+                body.entry("prompt_cache_options")
+                    .or_insert_with(|| serde_json::json!({ "ttl": "30m" }));
+            }
         }
         (providers::Provider::Xai, providers::OpenAiApi::ChatCompletions) => {
             if let Ok(value) = reqwest::header::HeaderValue::from_str(cache_key) {
@@ -949,6 +959,32 @@ mod tests {
         // The router forwards the harness-supplied key verbatim and never
         // synthesizes its own org/project/agent/model key.
         assert_eq!(upstream["prompt_cache_key"], "instance:abc-123");
+        assert!(upstream.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn gpt_5_6_provider_controls_use_the_new_cache_ttl() {
+        let session = aura_router_proxy::storage::SessionContext {
+            prompt_cache_key: Some("instance:abc-123".to_string()),
+            ..Default::default()
+        };
+        let mut upstream = json!({
+            "model": "gpt-5.6-terra",
+            "input": [],
+            "prompt_cache_retention": "24h"
+        });
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
+
+        super::apply_provider_request_controls(
+            aura_router_proxy::providers::Provider::OpenAi,
+            aura_router_proxy::providers::OpenAiApi::Responses,
+            &mut upstream_headers,
+            &mut upstream,
+            Some(&session),
+        );
+
+        assert_eq!(upstream["prompt_cache_key"], "instance:abc-123");
+        assert_eq!(upstream["prompt_cache_options"]["ttl"], "30m");
         assert!(upstream.get("prompt_cache_retention").is_none());
     }
 
@@ -1425,7 +1461,8 @@ mod tests {
         let requests = recorded_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["user_id"], "user-openai-billing");
-        assert_eq!(requests[0]["cost_cents"], 1860);
+        // GPT-5.5's 1M-token prompt uses the published long-context step.
+        assert_eq!(requests[0]["cost_cents"], 2820);
         assert_eq!(requests[0]["metric"]["provider"], "openai");
         assert_eq!(requests[0]["metric"]["model"], "aura-gpt-5-5");
         assert_eq!(requests[0]["metric"]["input_tokens"], 1_000_000);
